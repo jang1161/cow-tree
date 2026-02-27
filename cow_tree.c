@@ -212,15 +212,6 @@ static uint32_t get_position(page *p, int64_t key) {
 static int leaf_is_full(page *p)     { return p->num_keys == LEAF_ORDER - 1; }
 static int internal_is_full(page *p) { return p->num_keys == INTERNAL_ORDER - 1; }
 
-/* ═══════════════════════════════════════════════════════════
- * Traversal path
- * ═══════════════════════════════════════════════════════════
- *
- * path_entry.cidx:
- *   0 .. num_keys-1 → we followed internal[cidx].child
- *   RIGHTMOST_IDX   → we followed .pointer (rightmost child)
- */
-
 #define MAX_HEIGHT    16
 #define RIGHTMOST_IDX UINT32_MAX
 
@@ -253,18 +244,18 @@ static void cow_propagate(cow_tree *t, tpath *path, int from_level,
                            int has_split, int64_t split_key, pagenum_t split_right,
                            int has_sep,   int64_t old_sep,   int64_t new_sep)
 {
-    pagenum_t cur   = new_child;
-    int       split = has_split;
-    int64_t   pkey  = split_key;
+    pagenum_t cur = new_child;
+    int split = has_split;
+    int64_t pkey = split_key;
     pagenum_t pright= split_right;
 
     for (int i = from_level - 1; i >= 0; i--) {
         page anc;
         load_page(t, path->e[i].pn, &anc);
         uint32_t cidx = path->e[i].cidx;
-        uint32_t pos  = (cidx == RIGHTMOST_IDX) ? anc.num_keys : cidx;
+        uint32_t pos = (cidx == RIGHTMOST_IDX) ? anc.num_keys : cidx;
 
-        /* Optional: update a changed separator key in this ancestor */
+        //  update changed separator key in this ancestor
         if (has_sep) {
             for (uint32_t k = 0; k < anc.num_keys; k++) {
                 if ((int64_t)anc.internal[k].key == old_sep) {
@@ -275,16 +266,14 @@ static void cow_propagate(cow_tree *t, tpath *path, int from_level,
             }
         }
 
-        /* Update child pointer from stale location to cur */
-        if (cidx == RIGHTMOST_IDX) anc.pointer              = cur;
-        else                       anc.internal[cidx].child = cur;
+        if (cidx == RIGHTMOST_IDX) anc.pointer = cur;
+        else anc.internal[cidx].child = cur;
 
         if (!split) {
-            /* Simple CoW: just the pointer update */
             cur = cow_append_page(t, &anc);
-
-        } else if (!internal_is_full(&anc)) {
-            /* Space available: insert (pkey, pright) at pos */
+        } 
+        else if (!internal_is_full(&anc)) {
+            // space available: insert (pkey, pright) at pos
             for (int64_t j = (int64_t)anc.num_keys - 1; j >= (int64_t)pos; j--)
                 anc.internal[j+1] = anc.internal[j];
             anc.internal[pos].key   = (uint64_t)pkey;
@@ -295,73 +284,69 @@ static void cow_propagate(cow_tree *t, tpath *path, int from_level,
             cur   = cow_append_page(t, &anc);
             split = 0;
 
-        } else {
-            /* Full internal node: split it.
-             *
-             * Build combined key array   tkeys[0..ORDER-1]      (ORDER elements)
-             * Build combined child array tchld[0..ORDER]         (ORDER+1 elements)
-             * where ORDER = INTERNAL_ORDER.
-             */
-            const uint32_t ORDER = INTERNAL_ORDER;
-            int64_t   *tkeys = malloc(ORDER       * sizeof *tkeys);
-            pagenum_t *tchld = malloc((ORDER + 1) * sizeof *tchld);
+        } 
+        else {
+            // full internal node: split
+            const uint32_t order = INTERNAL_ORDER;
+            int64_t *tkeys = malloc(order * sizeof(*tkeys));
+            pagenum_t *tchld = malloc((order + 1) * sizeof(*tchld));
 
             for (uint32_t j = 0; j < pos; j++)
                 tkeys[j] = (int64_t)anc.internal[j].key;
             tkeys[pos] = pkey;
-            for (uint32_t j = pos; j < ORDER - 1; j++)
-                tkeys[j+1] = (int64_t)anc.internal[j].key;
+            for (uint32_t j = pos; j < order - 1; j++)
+                tkeys[j + 1] = (int64_t)anc.internal[j].key;
 
             for (uint32_t j = 0; j < pos; j++)
                 tchld[j] = anc.internal[j].child;
-            tchld[pos]   = cur;
-            tchld[pos+1] = pright;
-            for (uint32_t j = pos + 1; j < ORDER; j++)
-                tchld[j+1] = (j < ORDER - 1) ? anc.internal[j].child : anc.pointer;
+            tchld[pos] = cur;
+            tchld[pos + 1] = pright;
+            for (uint32_t j = pos + 1; j < order; j++)
+                tchld[j + 1] = (j < order - 1) ? anc.internal[j].child : anc.pointer;
 
-            uint32_t sp    = (ORDER + 1) / 2;
-            int64_t  newpk = tkeys[sp - 1];
+            uint32_t sp = (order + 1) / 2;
+            int64_t newpk = tkeys[sp - 1];
 
-            /* Rebuild left half into anc */
+            // rebuild left half
             for (uint32_t j = 0; j < sp - 1; j++) {
-                anc.internal[j].key   = (uint64_t)tkeys[j];
+                anc.internal[j].key = (uint64_t)tkeys[j];
                 anc.internal[j].child = tchld[j];
             }
-            anc.pointer  = tchld[sp - 1];
+            anc.pointer = tchld[sp - 1];
             anc.num_keys = sp - 1;
 
-            /* Build right half */
+            // new right half
             page r;
             memset(&r, 0, sizeof r);
             r.is_leaf   = 0;
-            for (uint32_t j = sp; j < ORDER; j++) {
-                r.internal[j - sp].key   = (uint64_t)tkeys[j];
+            for (uint32_t j = sp; j < order; j++) {
+                r.internal[j - sp].key = (uint64_t)tkeys[j];
                 r.internal[j - sp].child = tchld[j];
             }
-            r.pointer  = tchld[ORDER];
-            r.num_keys = ORDER - sp;
+            r.pointer = tchld[order];
+            r.num_keys = order - sp;
 
             free(tkeys); free(tchld);
 
             pagenum_t r_pn = cow_append_page(t, &r);
-            cur    = cow_append_page(t, &anc);
-            pkey   = newpk;
+            cur = cow_append_page(t, &anc);
+            pkey = newpk;
             pright = r_pn;
-            split  = 1;
+            split = 1;
         }
     }
 
     if (!split) {
         t->sb.root_pn = cur;
     } else {
-        /* Create new root */
+        // create new root
         page root;
         memset(&root, 0, sizeof root);
-        root.is_leaf           = 0;
-        root.num_keys          = 1;
-        root.internal[0].key   = (uint64_t)pkey;
+        root.is_leaf = 0;
+        root.num_keys = 1;
+        root.internal[0].key = (uint64_t)pkey;
         root.internal[0].child = cur;
-        root.pointer           = pright;
+        root.pointer = pright;
         t->sb.root_pn = cow_append_page(t, &root);
     }
     write_superblock(t);
@@ -386,17 +371,16 @@ record *cow_find(cow_tree *t, int64_t key) {
     return NULL;
 }
 
-void cow_insert(cow_tree *t, int64_t key, const char *value)
-{
-    /* ── Empty tree: create the first root leaf ── */
+void cow_insert(cow_tree *t, int64_t key, const char *value) {
     if (is_empty(t)) {
         page root;
         memset(&root, 0, sizeof root);
-        root.is_leaf          = 1;
-        root.num_keys         = 1;
-        root.pointer          = INVALID_PGN;
-        root.leaf[0].key      = (uint64_t)key;
+        root.is_leaf = 1;
+        root.num_keys = 1;
+        root.pointer = INVALID_PGN;
+        root.leaf[0].key = (uint64_t)key;
         memcpy(root.leaf[0].record.value, value, 120);
+
         t->sb.root_pn = cow_append_page(t, &root);
         write_superblock(t);
         return;
@@ -407,53 +391,60 @@ void cow_insert(cow_tree *t, int64_t key, const char *value)
     page leaf;
     load_page(t, path.e[path.depth - 1].pn, &leaf);
 
+    // leaf page is full
     if (!leaf_is_full(&leaf)) {
-        /* ── Simple insert ── */
         uint32_t pos = get_position(&leaf, key);
-        for (int64_t j = (int64_t)leaf.num_keys - 1; j >= (int64_t)pos; j--)
-            leaf.leaf[j+1] = leaf.leaf[j];
+
+        for (int64_t i = (int64_t)leaf.num_keys - 1; i >= (int64_t)pos; i--)
+            leaf.leaf[i + 1] = leaf.leaf[i];
         leaf.leaf[pos].key = (uint64_t)key;
         memcpy(leaf.leaf[pos].record.value, value, 120);
         leaf.num_keys++;
+
         pagenum_t new_leaf = cow_append_page(t, &leaf);
-        cow_propagate(t, &path, path.depth - 1, new_leaf,
-                      0, 0, INVALID_PGN, 0, 0, 0);
-    } else {
-        /* ── Leaf is full: split ── */
-        const uint32_t ORDER = LEAF_ORDER;
-        leaf_entity *tmp = malloc(ORDER * sizeof *tmp);
+        cow_propagate(t, &path, path.depth - 1, new_leaf, 0, 0, INVALID_PGN, 0, 0, 0);
+    } 
+    
+    // leaf is full, split
+    else {
+        const uint32_t order = LEAF_ORDER;
+        leaf_entity *tmp = malloc(order * sizeof *tmp);
 
         uint32_t pos = 0;
-        while (pos < leaf.num_keys && (int64_t)leaf.leaf[pos].key < key) pos++;
+        while (pos < leaf.num_keys && (int64_t)leaf.leaf[pos].key < key) 
+            pos++;
 
-        for (uint32_t i = 0; i < pos; i++)           tmp[i]   = leaf.leaf[i];
+        for (uint32_t i = 0; i < pos; i++)           
+            tmp[i] = leaf.leaf[i];
+        for (uint32_t i = pos; i < leaf.num_keys; i++) 
+            tmp[i + 1] = leaf.leaf[i];
+
         tmp[pos].key = (uint64_t)key;
         memcpy(tmp[pos].record.value, value, 120);
-        for (uint32_t i = pos; i < leaf.num_keys; i++) tmp[i+1] = leaf.leaf[i];
 
-        uint32_t sp = ORDER / 2;
+        uint32_t sp = order / 2;
 
-        /* Left leaf (reuse struct, new location) */
-        for (uint32_t i = 0; i < sp; i++) leaf.leaf[i] = tmp[i];
+        // left leaf (reuse struct, new location)
+        for (uint32_t i = 0; i < sp; i++) 
+            leaf.leaf[i] = tmp[i];
         leaf.num_keys = sp;
 
-        /* Right leaf */
+        // right leaf
         page right;
         memset(&right, 0, sizeof right);
         right.is_leaf   = 1;
-        for (uint32_t i = 0; i < ORDER - sp; i++) right.leaf[i] = tmp[sp + i];
-        right.num_keys = ORDER - sp;
+        for (uint32_t i = 0; i < order - sp; i++) 
+            right.leaf[i] = tmp[sp + i];
+        right.num_keys = order - sp;
         right.pointer  = leaf.pointer;   /* inherit right-sibling link */
 
         free(tmp);
 
-        /* Write right first to get its pn, then update left's sibling link */
         pagenum_t right_pn = cow_append_page(t, &right);
-        leaf.pointer       = right_pn;
-        pagenum_t left_pn  = cow_append_page(t, &leaf);
+        leaf.pointer = right_pn;
+        pagenum_t left_pn = cow_append_page(t, &leaf);
 
         int64_t promote = (int64_t)right.leaf[0].key;
-        cow_propagate(t, &path, path.depth - 1, left_pn,
-                      1, promote, right_pn, 0, 0, 0);
+        cow_propagate(t, &path, path.depth - 1, left_pn, 1, promote, right_pn, 0, 0, 0);
     }
 }
