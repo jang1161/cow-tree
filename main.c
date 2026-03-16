@@ -111,6 +111,11 @@ int main(int argc, char *argv[])
     int mode = atoi(argv[2]);
     const char *dev_path = argv[3];
 
+    printf("Resetting ZNS device...\n");
+    char cmd[256];
+    sprintf(cmd, "sudo nvme zns reset-zone -a %s", dev_path);
+    system(cmd);
+
     all_keys = malloc(sizeof(int) * total_keys);
     if (!all_keys) {
         perror("malloc keys failed");
