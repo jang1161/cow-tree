@@ -3,17 +3,17 @@ import matplotlib.pyplot as plt
 threads = [1, 2, 4, 8, 16, 32, 64]
 x = range(len(threads))
 
-ops_10k  = [7030, 9111, 11648, 13255, 15509, 18122, 20640]
-ops_50k  = [4608, 6139, 7530, 7878, 8902, 10681, 12545]
-ops_100k = [4291, 5730, 6303, 6803, 7113, 8480, 10094]
-ops_1m   = [3645, 4322, 4855, 5152, 5403, 5615, 6231]
+ops_10k = [7761.74, 9224.92, 12467.90, 13691.89, 16534.86, 19787.97, 23254.82]
+ops_100k = [8041.68, 9149.60, 11596.55, 12114.65, 14097.84, 17179.84, 20946.43]
+ops_1m = [5128.76, 6004.18, 7002.98, 6858.33, 7417.41, 7793.52, 8862.18]
+ops_10m = [3747.73, 4217.75, 3870.28, 4717.70, 5210.19, 5614.07, 5879.97]
 
 plt.figure(figsize=(8,6))
 
 plt.plot(x, ops_10k, marker='o', label="10K keys")
-plt.plot(x, ops_50k, marker='o', label="50K keys")
 plt.plot(x, ops_100k, marker='o', label="100K keys")
 plt.plot(x, ops_1m, marker='o', label="1M keys")
+plt.plot(x, ops_10m, marker='o', label="10M keys")
 
 plt.xlabel("Threads")
 plt.ylabel("Ops/sec")

@@ -6,7 +6,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
-#include "cow_tree_v3.h"
+#include "cow_v3.h"
 
 #define PROGRESS_STEP 1000
 
