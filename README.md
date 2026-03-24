@@ -2,12 +2,6 @@
 
 여러 COW B-tree 구현(버전)을 동일 워크로드로 비교하기 위한 실험 저장소입니다.
 
-## 핵심 목표
-
-- 버전별 동시성 모델(단일 writer, shard writer, stage2 pipeline) 성능 비교
-- 캐시 전략(thread-local, RAM table, global cache, set-associative cache) 비교
-- ZNS 쓰기 경로(nvme_zns_append 중심)에서 처리량/지연 변화 관찰
-
 ## 현재 저장소 구조
 
 - `src/variants/`: 버전별 C 구현(`cow_*.c`)
