@@ -82,7 +82,7 @@ make run 1000000 0 /dev/nvme3n2
 	- 예시 1: `./benchmark/run_bench.sh ram 100K=3 1M=3 10M=1 DEV=/dev/nvme3n2`
 	- 예시 2: `./benchmark/run_bench.sh ram 3 3 1 /dev/nvme3n2`
 	- 동작: 각 키 크기(100K/1M/10M)에 대해 `make run-<variant> <keys> 0 <dev>`를 지정 횟수만큼 반복 실행 후 스레드별 평균 throughput 계산
-	- `OUTFILE`은 선택 사항이며, 미지정 시 기본값은 `results/bench_MMDDHHMM.txt`
+	- 결과 파일은 처리량 요약만 저장하며, `OUTFILE` 미지정 시 기본값은 `results/<variant>.txt` (예: `results/ram.txt`)
 
 ## 권장 네이밍/운영 규칙
 
