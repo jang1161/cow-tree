@@ -1,0 +1,125 @@
+jang1161@splab:~/research/cow-tree$ sudo ./cow_test_zfs 1000000 0 /dev/nvme3n2
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+Random key set generated (1000000 keys).
+
+===== Running with 1 threads =====
+
+Threads: 1
+Elapsed time: 190.222106 seconds
+Average throughput: 5257.01 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=1000000 avg_batch=1.00
+ qlock_insert_us=0.53 qlock_sync_us=0.11 client_wait_us=184.87
+ txg_total_us=313.37 sort_us=0.24 apply_us=3.76 flush_us=114.89 publish_us=0.02
+ append_us=31.10 appends=3280450 sb_flush_us=57.83 sb_flush_cnt=18727
+ overlay_nodes_avg=3.28 overlay_nodes_max=7
+ cache_tl_hit=0 cache_ram_hit=3234035 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=0.50 qdepth_max=1 sync_idle_waits=1000001
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+===== Running with 2 threads =====
+
+Threads: 2
+Elapsed time: 138.345789 seconds
+Average throughput: 7228.26 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=852338 avg_batch=1.17
+ qlock_insert_us=1.71 qlock_sync_us=0.13 client_wait_us=268.69
+ txg_total_us=339.25 sort_us=0.33 apply_us=4.01 flush_us=121.66 publish_us=0.02
+ append_us=28.61 appends=3073872 sb_flush_us=54.54 sb_flush_cnt=13627
+ overlay_nodes_avg=3.61 overlay_nodes_max=10
+ cache_tl_hit=0 cache_ram_hit=3027543 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=0.62 qdepth_max=2 sync_idle_waits=820845
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+===== Running with 4 threads =====
+
+Threads: 4
+Elapsed time: 84.685595 seconds
+Average throughput: 11808.38 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=883319 avg_batch=1.13
+ qlock_insert_us=3.75 qlock_sync_us=0.13 client_wait_us=330.93
+ txg_total_us=484.28 sort_us=0.10 apply_us=4.64 flush_us=160.76 publish_us=0.02
+ append_us=26.14 appends=2711434 sb_flush_us=53.54 sb_flush_cnt=8350
+ overlay_nodes_avg=3.07 overlay_nodes_max=13
+ cache_tl_hit=0 cache_ram_hit=2664982 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=0.60 qdepth_max=4 sync_idle_waits=801698
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+===== Running with 8 threads =====
+
+Threads: 8
+Elapsed time: 71.216520 seconds
+Average throughput: 14041.69 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=493162 avg_batch=2.03
+ qlock_insert_us=3.46 qlock_sync_us=0.17 client_wait_us=563.17
+ txg_total_us=812.34 sort_us=0.24 apply_us=8.02 flush_us=270.58 publish_us=0.02
+ append_us=25.32 appends=2361563 sb_flush_us=58.18 sb_flush_cnt=7018
+ overlay_nodes_avg=4.79 overlay_nodes_max=21
+ cache_tl_hit=0 cache_ram_hit=2315175 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=1.18 qdepth_max=8 sync_idle_waits=391219
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+===== Running with 16 threads =====
+
+Threads: 16
+Elapsed time: 65.915793 seconds
+Average throughput: 15170.87 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=212490 avg_batch=4.71
+ qlock_insert_us=3.97 qlock_sync_us=0.30 client_wait_us=1043.88
+ txg_total_us=1447.53 sort_us=0.80 apply_us=15.61 flush_us=494.16 publish_us=0.02
+ append_us=25.44 appends=2156936 sb_flush_us=52.53 sb_flush_cnt=6502
+ overlay_nodes_avg=10.15 overlay_nodes_max=39
+ cache_tl_hit=0 cache_ram_hit=2110553 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=2.14 qdepth_max=16 sync_idle_waits=171689
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+===== Running with 32 threads =====
+
+Threads: 32
+Elapsed time: 62.027818 seconds
+Average throughput: 16121.80 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=114027 avg_batch=8.77
+ qlock_insert_us=4.56 qlock_sync_us=0.42 client_wait_us=1972.36
+ txg_total_us=2694.49 sort_us=2.38 apply_us=27.60 flush_us=909.73 publish_us=0.02
+ append_us=25.71 appends=2014894 sb_flush_us=46.78 sb_flush_cnt=6126
+ overlay_nodes_avg=17.67 overlay_nodes_max=69
+ cache_tl_hit=0 cache_ram_hit=1968572 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=5.72 qdepth_max=32 sync_idle_waits=85358
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+===== Running with 64 threads =====
+
+Threads: 64
+Elapsed time: 59.030470 seconds
+Average throughput: 16940.40 ops/sec
+
+[cow_zfs profile]
+ inserts=1000000 batches=90710 avg_batch=11.02
+ qlock_insert_us=6.11 qlock_sync_us=0.47 client_wait_us=3756.80
+ txg_total_us=4909.35 sort_us=3.39 apply_us=52.14 flush_us=1583.68 publish_us=0.02
+ append_us=25.91 appends=1879135 sb_flush_us=43.88 sb_flush_cnt=5833
+ overlay_nodes_avg=20.72 overlay_nodes_max=127
+ cache_tl_hit=0 cache_ram_hit=1832791 cache_global_hit=0 cache_miss=0 odirect_reads=0
+ qdepth_avg=13.83 qdepth_max=60 sync_idle_waits=61056
+Resetting ZNS device...
+zns-reset-zone: Success, action:4 zone:0 all:1 zcapc:0 nsid:2
+
+All tests completed.

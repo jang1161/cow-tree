@@ -1,0 +1,17 @@
+perf.data
+build/
+
+# Local benchmark binaries (legacy names)
+cow_test_bt
+cow_test_ram
+cow_test_ram_async
+cow_test_ram2
+cow_test_ram3
+cow_test_ram_stage2
+cow_test_zfs
+
+# Local benchmark outputs
+result_*.txt
+
+# Local artifact in refs
+refs/ref4_doeun/cowbt_zns

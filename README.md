@@ -1,54 +1,92 @@
-## 1) no-use/cow_tree_v1
+# COW Tree ZNS Benchmark
 
-- 한 줄 요약: 초기 COW 기준 구현. 스냅샷 루트/시퀀스를 읽고, 새 루트를 만든 뒤 publish 시점에 commit lock으로 원자적 교체.
-- 읽기 경로: find 시점에 root+seq 스냅샷을 읽고 해당 루트 기준으로 탐색.
-- 쓰기 경로: 호출 스레드가 직접 leaf split/상위 propagate를 수행해서 candidate root 생성.
-- publish/락: 마지막에 commit lock을 잡고 "기대(root, seq)"와 같으면 superblock을 디스크에 쓰며 커밋.
-- 성격: 단순하고 이해하기 쉬운 베이스라인(동시성은 publish 구간 mutex 중심).
+여러 COW B-tree 구현(버전)을 동일 워크로드로 비교하기 위한 실험 저장소입니다.
 
-## 2) cow_ram
+## 핵심 목표
 
-- 한 줄 요약: 단일 writer 배치 처리 + RAM 페이지 캐시를 붙인 기본 RAM 최적화 버전.
-- 읽기 경로: thread-local read cache + RAM hash table cache + O_DIRECT read fallback.
-- 쓰기 경로: insert 요청을 큐에 넣고 writer thread가 배치 정렬 후 overlay 트리를 만들어 한 번에 flush.
-- publish/락: volatile superblock seq를 odd/even으로 토글해서 lock-free 스냅샷 읽기, 주기적 flusher가 durable superblock 반영.
-- 성격: write를 비동기 큐로 직렬화해서 경합을 낮추는 1-writer 구조.
+- 버전별 동시성 모델(단일 writer, shard writer, stage2 pipeline) 성능 비교
+- 캐시 전략(thread-local, RAM table, global cache, set-associative cache) 비교
+- ZNS 쓰기 경로(nvme_zns_append 중심)에서 처리량/지연 변화 관찰
 
-## 3) cow_ram_internal
+## 현재 저장소 구조
 
-- 한 줄 요약: cow_ram에서 RAM 캐시 대상을 내부 노드 중심으로 제한한 버전.
-- 핵심 차이: ram_cache_eligible 조건으로 내부 노드(is_leaf == 0)만 RAM table에 올림.
-- 의도: 리프 churn(잦은 갱신)로 인한 캐시 오염을 줄이고 탐색 경로(내부 노드) hit를 안정화.
-- 그 외 구조: writer 배치/overlay flush/publish/flusher는 cow_ram과 동일 계열.
+- `src/variants/`: 버전별 C 구현(`cow_*.c`)
+- `include/variants/`: 버전별 헤더(`cow_*.h`)
+- `bench/bench_main.c`: 공통 벤치 진입점(버전별로 재사용)
+- `benchmark/`: 배치 실행/결과 수집 스크립트
+- `results/`: 측정 결과 로그
+- `refs/`: 외부 참고 구현
+- `docs/`: 버전 매핑, 정리 문서
 
-## 4) cow_ram_async
+## 빌드 (통합)
 
-- 한 줄 요약: cow_ram 계열에서 overlay flush를 레벨 단위 병렬 작업으로 확장한 버전.
-- 읽기 경로: thread-local + RAM table 캐시(ram_table_lock 사용).
-- 쓰기 경로: writer가 배치 적용 후 flush_overlay_async를 통해 하위 레벨부터 병렬 flush.
-- publish/락: publish는 single-writer seq 토글 방식 유지, durable 반영은 별도 flusher thread.
-- 성격: 트리 flush 구간의 병렬성을 높여 배치 flush 지연을 줄이려는 실험 버전.
+이 저장소는 버전별 바이너리를 `build/bin` 아래로 통합 생성합니다.
 
-## 5) cow_ram2
+1. 전체 빌드
 
-- 한 줄 요약: key sharding 기반 멀티 writer 버전(WRITER_SHARDS=8).
-- 읽기 경로: key -> shard 매핑 후 해당 shard root 스냅샷으로 조회.
-- 쓰기 경로: shard별 큐/writer thread가 독립 배치 처리 후 shard root를 publish.
-- publish/락: shard_root_pn/shard_seq_no를 개별 갱신하고, 전역 volatile superblock은 shard 0 경로 중심으로 반영.
-- 캐시/락 차이: RAM table 락을 mutex 대신 pthread_rwlock으로 분리(read/write lock).
-- 성격: writer 병렬성 확대가 목적이며, 전역 루트 표현은 단일 트리 버전들과 다르게 shard 관점.
+```bash
+make all
+```
 
-## 6) cow_v3
+2. 특정 버전만 빌드
 
-- 한 줄 요약: 단일 writer 구조 + 전역 페이지 캐시(global page cache) 추가 버전.
-- 읽기 경로: thread-local cache 이후 global cache(슬롯별 mutex 보호) 조회, miss 시 O_DIRECT read.
-- 쓰기 경로: writer 배치 + overlay flush + single-root publish(기본 골격은 ram 계열과 유사).
-- 성격: RAM table 대신(또는 보완) 전역 공유 캐시로 스레드 간 read reuse를 노린 버전.
+```bash
+make bench-ram
+make bench-zfs
+make bench-ram_stage2
+```
 
-## 7) cow_v3_multi-cache
+3. 사용 가능한 버전 목록
 
-- 한 줄 요약: cow_v3의 전역 캐시를 set-associative multi-way로 확장한 버전.
-- 캐시 구조: GLOBAL_PAGE_CACHE_SETS x GLOBAL_PAGE_CACHE_WAYS(4-way), set lock + RR victim 교체.
-- 읽기 경로: set 내 way 탐색으로 hit 판단, miss/eviction 통계 수집.
-- 쓰기 경로: writer 배치/publish는 v3 계열 동일, 차이는 캐시 충돌 완화 전략.
-- 성격: 단일 슬롯 해시 충돌 문제를 줄여 고경합 read workload에서 hit율/지연 개선을 노린 버전.
+```bash
+make list
+```
+
+4. 기존 이름(`cow_test_*`) 호환 심볼릭 링크 생성
+
+```bash
+make compat
+```
+
+## 실행
+
+1. 특정 버전 실행
+
+```bash
+make run-ram KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
+```
+
+2. 기본 실행(기본 버전: `ram`)
+
+```bash
+make run KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
+```
+
+인자 의미:
+
+- `KEYS`: 키 개수
+- `MODE`: `0`이면 전체 스레드(1/2/4/8/16/32/64), 아니면 단일 스레드 수
+- `DEV`: ZNS 디바이스 경로
+
+## 버전 매핑
+
+버전별 구현 파일, 빌드 타겟, 특징은 아래 문서로 정리했습니다.
+
+- `docs/variants.md`
+- `version_quick_guide.md`
+- `summary.md`
+
+## 벤치 스크립트
+
+- `benchmark/run_bench.sh`
+	- 기본 바이너리: `./build/bin/cow-bench-ram_async`
+	- 필요 시 `BINARY`, `DEVICE`, `OUTFILE` 환경변수로 덮어쓰기 가능
+- `benchmark/run_bench_info.sh`
+	- 기본 바이너리: `./build/bin/cow-bench-ram`
+	- 필요 시 `BINARY`, `DEVICE`, `OUTFILE` 환경변수로 덮어쓰기 가능
+
+## 권장 네이밍/운영 규칙
+
+- 버전 ID는 `ram`, `ram_async`, `ram_stage2`, `v3_multi_cache`처럼 짧고 일관되게 유지
+- 분석 결과 파일은 `results/<variant>_<workload>.txt` 형태로 저장
+- 실험 중간 산출물(바이너리/임시 결과)은 Git 추적에서 제외

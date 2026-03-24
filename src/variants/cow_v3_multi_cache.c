@@ -7,7 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "cow_tree_v3.h"
+#include "cow_v3_multi_cache.h"
 
 #define MAX_HEIGHT 32
 #define RIGHTMOST_IDX UINT32_MAX
@@ -17,7 +17,8 @@
 #define WRITER_BATCH_MIN_WAIT_US 20
 
 #define READ_CACHE_SLOTS 64
-#define GLOBAL_PAGE_CACHE_SLOTS 4096
+#define GLOBAL_PAGE_CACHE_SETS 8192 * 4
+#define GLOBAL_PAGE_CACHE_WAYS 4
 #define TEMP_NODE_BIT (1ULL << 63)
 
 typedef uint64_t node_id_t;
@@ -68,15 +69,28 @@ static pthread_key_t req_tls_key;
 static pthread_once_t req_tls_key_once = PTHREAD_ONCE_INIT;
 static __thread read_cache_entry tl_read_cache[READ_CACHE_SLOTS];
 
+static inline uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 typedef struct
 {
-    pthread_mutex_t lock;
     uint8_t valid;
     pagenum_t pn;
     page data;
 } global_page_cache_entry;
 
-static global_page_cache_entry *g_page_cache;
+typedef struct
+{
+    pthread_mutex_t lock;
+    uint32_t rr_victim;
+    global_page_cache_entry way[GLOBAL_PAGE_CACHE_WAYS];
+} global_page_cache_set;
+
+static global_page_cache_set *g_page_cache;
 static pthread_once_t g_page_cache_once = PTHREAD_ONCE_INIT;
 
 static inline int is_temp_id(node_id_t id)
@@ -104,9 +118,9 @@ static inline uint64_t page_hash_u64(uint64_t x)
     return x;
 }
 
-static inline global_page_cache_entry *global_cache_slot(pagenum_t pn)
+static inline global_page_cache_set *global_cache_set_slot(pagenum_t pn)
 {
-    return &g_page_cache[page_hash_u64((uint64_t)pn) & (GLOBAL_PAGE_CACHE_SLOTS - 1)];
+    return &g_page_cache[page_hash_u64((uint64_t)pn) & (GLOBAL_PAGE_CACHE_SETS - 1)];
 }
 
 static void free_tls_buf(void *ptr)
@@ -144,24 +158,25 @@ static void init_req_tls_key(void)
 
 static void init_global_page_cache(void)
 {
-    g_page_cache = calloc(GLOBAL_PAGE_CACHE_SLOTS, sizeof(*g_page_cache));
+    g_page_cache = calloc(GLOBAL_PAGE_CACHE_SETS, sizeof(*g_page_cache));
     if (!g_page_cache)
     {
         perror("calloc global page cache");
         exit(EXIT_FAILURE);
     }
 
-    for (size_t i = 0; i < GLOBAL_PAGE_CACHE_SLOTS; i++)
+    for (size_t i = 0; i < GLOBAL_PAGE_CACHE_SETS; i++)
     {
         if (pthread_mutex_init(&g_page_cache[i].lock, NULL) != 0)
         {
             perror("pthread_mutex_init global page cache");
             exit(EXIT_FAILURE);
         }
+        g_page_cache[i].rr_victim = 0;
     }
 }
 
-static int global_cache_lookup(pagenum_t pn, page *dst)
+static int global_cache_lookup(cow_tree *t, pagenum_t pn, page *dst)
 {
     if (pthread_once(&g_page_cache_once, init_global_page_cache) != 0)
     {
@@ -169,18 +184,27 @@ static int global_cache_lookup(pagenum_t pn, page *dst)
         exit(EXIT_FAILURE);
     }
 
-    global_page_cache_entry *e = global_cache_slot(pn);
-    pthread_mutex_lock(&e->lock);
-    int hit = e->valid && e->pn == pn;
-    if (hit)
+    global_page_cache_set *set = global_cache_set_slot(pn);
+    pthread_mutex_lock(&set->lock);
+
+    for (int w = 0; w < GLOBAL_PAGE_CACHE_WAYS; w++)
     {
-        *dst = e->data;
+        global_page_cache_entry *e = &set->way[w];
+        if (e->valid && e->pn == pn)
+        {
+            *dst = e->data;
+            pthread_mutex_unlock(&set->lock);
+            atomic_fetch_add_explicit(&t->stat_global_cache_hit, 1, memory_order_relaxed);
+            return 1;
+        }
     }
-    pthread_mutex_unlock(&e->lock);
-    return hit;
+
+    pthread_mutex_unlock(&set->lock);
+    atomic_fetch_add_explicit(&t->stat_global_cache_miss, 1, memory_order_relaxed);
+    return 0;
 }
 
-static void global_cache_insert(pagenum_t pn, const page *src)
+static void global_cache_insert(cow_tree *t, pagenum_t pn, const page *src)
 {
     if (pthread_once(&g_page_cache_once, init_global_page_cache) != 0)
     {
@@ -188,12 +212,44 @@ static void global_cache_insert(pagenum_t pn, const page *src)
         exit(EXIT_FAILURE);
     }
 
-    global_page_cache_entry *e = global_cache_slot(pn);
-    pthread_mutex_lock(&e->lock);
+    global_page_cache_set *set = global_cache_set_slot(pn);
+    pthread_mutex_lock(&set->lock);
+
+    for (int w = 0; w < GLOBAL_PAGE_CACHE_WAYS; w++)
+    {
+        global_page_cache_entry *e = &set->way[w];
+        if (e->valid && e->pn == pn)
+        {
+            e->data = *src;
+            pthread_mutex_unlock(&set->lock);
+            return;
+        }
+    }
+
+    for (int w = 0; w < GLOBAL_PAGE_CACHE_WAYS; w++)
+    {
+        global_page_cache_entry *e = &set->way[w];
+        if (!e->valid)
+        {
+            e->valid = 1;
+            e->pn = pn;
+            e->data = *src;
+            pthread_mutex_unlock(&set->lock);
+            return;
+        }
+    }
+
+    uint32_t victim = set->rr_victim & (GLOBAL_PAGE_CACHE_WAYS - 1);
+    set->rr_victim++;
+    global_page_cache_entry *e = &set->way[victim];
+    if (e->valid && e->pn != pn)
+    {
+        atomic_fetch_add_explicit(&t->stat_set_conflict_evictions, 1, memory_order_relaxed);
+    }
     e->valid = 1;
     e->pn = pn;
     e->data = *src;
-    pthread_mutex_unlock(&e->lock);
+    pthread_mutex_unlock(&set->lock);
 }
 
 static void *get_tls_direct_read_buf(void)
@@ -346,7 +402,7 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
         return;
     }
 
-    if (global_cache_lookup(pn, dst))
+    if (global_cache_lookup(t, pn, dst))
     {
         slot->valid = 1;
         slot->pn = pn;
@@ -363,6 +419,7 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
             perror("load_page(O_DIRECT)");
             exit(EXIT_FAILURE);
         }
+        atomic_fetch_add_explicit(&t->stat_odirect_reads, 1, memory_order_relaxed);
         memcpy(dst, raw, PAGE_SIZE);
     }
     else
@@ -377,7 +434,7 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
     slot->valid = 1;
     slot->pn = pn;
     slot->data = *dst;
-    global_cache_insert(pn, dst);
+    global_cache_insert(t, pn, dst);
 }
 
 static int zone_append_raw_nolock(cow_tree *t, uint32_t zone_id, const void *buf,
@@ -466,7 +523,7 @@ static pagenum_t cow_append_page(cow_tree *t, page *p)
             }
 
             p->pn = pn;
-            global_cache_insert(pn, p);
+            global_cache_insert(t, pn, p);
             return pn;
         }
 
@@ -1122,7 +1179,11 @@ static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
 {
     int n = 0;
 
+    uint64_t qwait_start = monotonic_ns();
     pthread_mutex_lock(&t->q_lock);
+    uint64_t qwait_end = monotonic_ns();
+    atomic_fetch_add_explicit(&t->stat_q_lock_wait_ns_writer, qwait_end - qwait_start, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_q_lock_wait_samples_writer, 1, memory_order_relaxed);
 
     while (!atomic_load_explicit(&t->stop_writer, memory_order_acquire) && t->q_head == NULL)
     {
@@ -1228,6 +1289,9 @@ static void *writer_main(void *arg)
         int n = pop_batch(t, batch, WRITER_BATCH_MAX);
         if (n == 0)
             break;
+
+        atomic_fetch_add_explicit(&t->stat_batches, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&t->stat_batch_items, (uint64_t)n, memory_order_relaxed);
 
         pagenum_t root;
         uint64_t seq;
@@ -1432,6 +1496,47 @@ void cow_close(cow_tree *t)
     pthread_mutex_unlock(&t->q_lock);
     pthread_join(t->writer_tid, NULL);
 
+        uint64_t cache_hit = atomic_load_explicit(&t->stat_global_cache_hit, memory_order_relaxed);
+        uint64_t cache_miss = atomic_load_explicit(&t->stat_global_cache_miss, memory_order_relaxed);
+        uint64_t conflict_evict = atomic_load_explicit(&t->stat_set_conflict_evictions, memory_order_relaxed);
+        uint64_t odirect_reads = atomic_load_explicit(&t->stat_odirect_reads, memory_order_relaxed);
+
+        uint64_t qwait_ins_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_insert, memory_order_relaxed);
+        uint64_t qwait_ins_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_insert, memory_order_relaxed);
+        uint64_t qwait_w_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_writer, memory_order_relaxed);
+        uint64_t qwait_w_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_writer, memory_order_relaxed);
+
+        uint64_t batches = atomic_load_explicit(&t->stat_batches, memory_order_relaxed);
+        uint64_t batch_items = atomic_load_explicit(&t->stat_batch_items, memory_order_relaxed);
+
+        double hit_ratio = (cache_hit + cache_miss > 0)
+                   ? ((double)cache_hit * 100.0 / (double)(cache_hit + cache_miss))
+                   : 0.0;
+        double qwait_ins_avg_us = (qwait_ins_samples > 0)
+                      ? ((double)qwait_ins_ns / (double)qwait_ins_samples / 1000.0)
+                      : 0.0;
+        double qwait_w_avg_us = (qwait_w_samples > 0)
+                    ? ((double)qwait_w_ns / (double)qwait_w_samples / 1000.0)
+                    : 0.0;
+        double avg_batch_size = (batches > 0) ? ((double)batch_items / (double)batches) : 0.0;
+
+        fprintf(stderr,
+            "[multiway-cache] global_cache hit=%lu miss=%lu hit_ratio=%.2f%%\n"
+            "[multiway-cache] set_conflict_evictions=%lu\n"
+            "[multiway-cache] odirect_reads=%lu\n"
+            "[multiway-cache] q_lock_wait_avg_us insert=%.2f writer=%.2f\n"
+            "[multiway-cache] avg_batch_size=%.2f batches=%lu items=%lu\n",
+            (unsigned long)cache_hit,
+            (unsigned long)cache_miss,
+            hit_ratio,
+            (unsigned long)conflict_evict,
+            (unsigned long)odirect_reads,
+            qwait_ins_avg_us,
+            qwait_w_avg_us,
+            avg_batch_size,
+            (unsigned long)batches,
+            (unsigned long)batch_items);
+
     atomic_store_explicit(&t->flusher_stop, true, memory_order_release);
     pthread_join(t->flusher_tid, NULL);
 
@@ -1513,7 +1618,11 @@ void cow_insert(cow_tree *t, int64_t key, const char *value)
     req->done = 0;
     req->next = NULL;
 
+    uint64_t qwait_start = monotonic_ns();
     pthread_mutex_lock(&t->q_lock);
+    uint64_t qwait_end = monotonic_ns();
+    atomic_fetch_add_explicit(&t->stat_q_lock_wait_ns_insert, qwait_end - qwait_start, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_q_lock_wait_samples_insert, 1, memory_order_relaxed);
     if (t->q_tail)
         t->q_tail->next = req;
     else

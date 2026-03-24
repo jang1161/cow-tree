@@ -1,14 +1,33 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
-#include "include/variants/cow_v3.h"
 
-#define PROGRESS_STEP 1000
+#if defined(COW_VARIANT_BT)
+#include "cow_bt.h"
+#elif defined(COW_VARIANT_RAM)
+#include "cow_ram.h"
+#elif defined(COW_VARIANT_RAM_ASYNC)
+#include "cow_ram_async.h"
+#elif defined(COW_VARIANT_RAM2)
+#include "cow_ram2.h"
+#elif defined(COW_VARIANT_RAM3)
+#include "cow_ram3.h"
+#elif defined(COW_VARIANT_RAM_STAGE2)
+#include "cow_ram_stage2.h"
+#elif defined(COW_VARIANT_V3)
+#include "cow_v3.h"
+#elif defined(COW_VARIANT_V3_MULTI_CACHE)
+#include "cow_v3_multi_cache.h"
+#elif defined(COW_VARIANT_ZFS)
+#include "cow_zfs.h"
+#else
+#include "cow_ram.h"
+#endif
 
 typedef struct {
     cow_tree *t;
@@ -17,33 +36,36 @@ typedef struct {
     int end;
 } thread_arg;
 
-atomic_int global_done = 0;
+static int *all_keys;
+static int total_keys;
 
-int *all_keys = NULL;
-int total_keys = 0;   // ← 추가
-
-void *worker(void *arg)
+static void *worker(void *arg)
 {
     thread_arg *a = (thread_arg *)arg;
 
     for (int i = a->start; i < a->end; i++) {
-
         int key = a->keys[i];
-
         char buf[120];
-        sprintf(buf, "value-%d", key);
-
+        snprintf(buf, sizeof(buf), "value-%d", key);
         cow_insert(a->t, key, buf);
     }
 
     return NULL;
 }
 
-void run_test(const char *dev_path, int num_threads)
+static void reset_device(const char *dev_path)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "sudo nvme zns reset-zone -a %s", dev_path);
+    int rc = system(cmd);
+    if (rc == -1) {
+        perror("system(nvme reset-zone)");
+    }
+}
+
+static void run_test(const char *dev_path, int num_threads)
 {
     printf("\n===== Running with %d threads =====\n", num_threads);
-
-    atomic_store(&global_done, 0);
 
     cow_tree *t = cow_open(dev_path);
     if (!t) {
@@ -51,21 +73,27 @@ void run_test(const char *dev_path, int num_threads)
         exit(1);
     }
 
-    pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
-    thread_arg *args = malloc(sizeof(thread_arg) * num_threads);
+    pthread_t *threads = malloc(sizeof(*threads) * (size_t)num_threads);
+    thread_arg *args = malloc(sizeof(*args) * (size_t)num_threads);
+    if (!threads || !args) {
+        perror("malloc threads/args failed");
+        free(threads);
+        free(args);
+        cow_close(t);
+        exit(1);
+    }
 
     int chunk = total_keys / num_threads;
 
-    struct timespec start, end;
+    struct timespec start;
+    struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     for (int i = 0; i < num_threads; i++) {
         args[i].t = t;
         args[i].keys = all_keys;
         args[i].start = i * chunk;
-        args[i].end = (i == num_threads - 1)
-                      ? total_keys
-                      : (i + 1) * chunk;
+        args[i].end = (i == num_threads - 1) ? total_keys : (i + 1) * chunk;
 
         pthread_create(&threads[i], NULL, worker, &args[i]);
     }
@@ -92,10 +120,7 @@ void run_test(const char *dev_path, int num_threads)
     free(args);
 
     printf("Resetting ZNS device...\n");
-    char cmd[256];
-    sprintf(cmd, "sudo nvme zns reset-zone -a %s", dev_path);
-    system(cmd);
-
+    reset_device(dev_path);
     sleep(1);
 }
 
@@ -103,7 +128,7 @@ int main(int argc, char *argv[])
 {
     if (argc != 4) {
         printf("Usage: %s <key_num> <mode> <device>\n", argv[0]);
-        printf("mode: 0=all  1=1thread  2=2thread  4=4thread  8  16 32\n");
+        printf("mode: 0=all  1 2 4 8 16 32 64\n");
         return 1;
     }
 
@@ -112,21 +137,19 @@ int main(int argc, char *argv[])
     const char *dev_path = argv[3];
 
     printf("Resetting ZNS device...\n");
-    char cmd[256];
-    sprintf(cmd, "sudo nvme zns reset-zone -a %s", dev_path);
-    system(cmd);
+    reset_device(dev_path);
 
-    all_keys = malloc(sizeof(int) * total_keys);
+    all_keys = malloc(sizeof(*all_keys) * (size_t)total_keys);
     if (!all_keys) {
         perror("malloc keys failed");
         return 1;
     }
 
-    for (int i = 0; i < total_keys; i++)
+    for (int i = 0; i < total_keys; i++) {
         all_keys[i] = i;
+    }
 
     srand(54321);
-
     for (int i = total_keys - 1; i > 0; i--) {
         int j = rand() % (i + 1);
         int tmp = all_keys[i];
@@ -137,7 +160,7 @@ int main(int argc, char *argv[])
     printf("Random key set generated (%d keys).\n", total_keys);
 
     int thread_counts[] = {1, 2, 4, 8, 16, 32, 64};
-    int num_configs = sizeof(thread_counts) / sizeof(thread_counts[0]);
+    int num_configs = (int)(sizeof(thread_counts) / sizeof(thread_counts[0]));
 
     if (mode == 0) {
         for (int i = 0; i < num_configs; i++) {
@@ -145,7 +168,6 @@ int main(int argc, char *argv[])
         }
     } else {
         int valid = 0;
-
         for (int i = 0; i < num_configs; i++) {
             if (mode == thread_counts[i]) {
                 run_test(dev_path, mode);
@@ -156,14 +178,13 @@ int main(int argc, char *argv[])
 
         if (!valid) {
             printf("Invalid mode: %d\n", mode);
-            printf("Allowed values: 0, 1, 2, 4, 8, 16\n");
+            printf("Allowed values: 0, 1, 2, 4, 8, 16, 32, 64\n");
             free(all_keys);
             return 1;
         }
     }
 
     free(all_keys);
-
     printf("\nAll tests completed.\n");
     return 0;
 }
