@@ -1,5 +1,6 @@
 perf.data
 build/
+tmp*
 
 # Local benchmark binaries (legacy names)
 cow_test_bt

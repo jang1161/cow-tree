@@ -55,9 +55,20 @@ VAR_DEF_zfs := COW_VARIANT_ZFS
 VAR_DESC_zfs := zfs-style txg pipeline
 
 DEFAULT_VARIANT ?= ram
-KEYS ?= 1000000
-MODE ?= 0
-DEV ?= /dev/nvme3n2
+
+RUN_GOAL := $(firstword $(MAKECMDGOALS))
+ifneq (,$(filter run run-%,$(RUN_GOAL)))
+RUN_POS_ARGS := $(wordlist 2,4,$(MAKECMDGOALS))
+ifneq ($(strip $(RUN_POS_ARGS)),)
+.PHONY: $(RUN_POS_ARGS)
+$(RUN_POS_ARGS):
+	@:
+endif
+endif
+
+RUN_KEYS := $(or $(KEYS),$(word 1,$(RUN_POS_ARGS)),1000000)
+RUN_MODE := $(or $(MODE),$(word 2,$(RUN_POS_ARGS)),0)
+RUN_DEV := $(or $(DEV),$(word 3,$(RUN_POS_ARGS)),/dev/nvme3n2)
 
 .PHONY: all
 all: $(addprefix $(BIN_DIR)/cow-bench-,$(VARIANTS))
@@ -74,7 +85,7 @@ bench-$(1): $(BIN_DIR)/cow-bench-$(1)
 
 .PHONY: run-$(1)
 run-$(1): bench-$(1)
-	sudo ./$(BIN_DIR)/cow-bench-$(1) $(KEYS) $(MODE) $(DEV)
+	sudo ./$(BIN_DIR)/cow-bench-$(1) $(RUN_KEYS) $(RUN_MODE) $(RUN_DEV)
 endef
 
 $(foreach v,$(VARIANTS),$(eval $(call MAKE_VARIANT_RULE,$(v))))

@@ -55,6 +55,10 @@ make run-ram KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
 ```bash
 make run KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
 ```
+또는
+```bash
+make run 1000000 0 /dev/nvme3n2
+```
 
 인자 의미:
 
@@ -73,11 +77,12 @@ make run KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
 ## 벤치 스크립트
 
 - `benchmark/run_bench.sh`
-	- 기본 바이너리: `./build/bin/cow-bench-ram_async`
-	- 필요 시 `BINARY`, `DEVICE`, `OUTFILE` 환경변수로 덮어쓰기 가능
-- `benchmark/run_bench_info.sh`
-	- 기본 바이너리: `./build/bin/cow-bench-ram`
-	- 필요 시 `BINARY`, `DEVICE`, `OUTFILE` 환경변수로 덮어쓰기 가능
+	- 실행 방식 1(라벨형): `./benchmark/run_bench.sh <variant> 100K=<n> 1M=<n> 10M=<n> DEV=<path> [OUTFILE=<path>]`
+	- 실행 방식 2(숫자형): `./benchmark/run_bench.sh <variant> <repeat_100K> <repeat_1M> <repeat_10M> [device] [outfile]`
+	- 예시 1: `./benchmark/run_bench.sh ram 100K=3 1M=3 10M=1 DEV=/dev/nvme3n2`
+	- 예시 2: `./benchmark/run_bench.sh ram 3 3 1 /dev/nvme3n2`
+	- 동작: 각 키 크기(100K/1M/10M)에 대해 `make run-<variant> <keys> 0 <dev>`를 지정 횟수만큼 반복 실행 후 스레드별 평균 throughput 계산
+	- `OUTFILE`은 선택 사항이며, 미지정 시 기본값은 `results/bench_MMDDHHMM.txt`
 
 ## 권장 네이밍/운영 규칙
 
