@@ -130,6 +130,7 @@ typedef struct
 
     pthread_mutex_t stage2_lock;
     pthread_cond_t stage2_cv;
+    pthread_mutex_t commit_lock;
     txg_batch_job *stage2_head;
     txg_batch_job *stage2_tail;
 

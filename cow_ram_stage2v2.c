@@ -18,6 +18,8 @@
 #define TXG_COMMIT_MERGE_JOBS 4
 #define TXG_COMMIT_MERGE_ITEMS 256
 #define TXG_COALESCE_QD_MIN 8
+#define TXG_INLINE_QD_MAX 2
+#define TXG_INLINE_ITEMS_MAX 8
 #define PROF_SAMPLE_MASK 1023U
 
 #define READ_CACHE_SLOTS 64
@@ -1372,6 +1374,8 @@ static int cmp_batch_item(const void *a, const void *b)
 
 static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs)
 {
+    pthread_mutex_lock(&t->commit_lock);
+
     int merged_n = 0;
     batch_item merged_items[TXG_COMMIT_MERGE_ITEMS];
     int ord = 0;
@@ -1391,6 +1395,7 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs)
     {
         for (int j = 0; j < njobs; j++)
             free(jobs[j]);
+        pthread_mutex_unlock(&t->commit_lock);
         return;
     }
 
@@ -1461,6 +1466,8 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs)
         complete_req(merged_items[i].req);
     for (int j = 0; j < njobs; j++)
         free(jobs[j]);
+
+    pthread_mutex_unlock(&t->commit_lock);
 }
 
 static void *txg_batch_main(void *arg)
@@ -1491,11 +1498,19 @@ static void *txg_batch_main(void *arg)
             job->items[i].ord = i;
         }
 
-        qsort(job->items, (size_t)n, sizeof(job->items[0]), cmp_batch_item);
         atomic_fetch_add_explicit(&t->stat_batches, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_batch_items, (uint64_t)n, memory_order_relaxed);
 
-        stage2_enqueue_job(t, job);
+        uint64_t qd_now = atomic_load_explicit(&t->stat_queue_depth_current, memory_order_relaxed);
+        if (n <= TXG_INLINE_ITEMS_MAX && qd_now <= TXG_INLINE_QD_MAX)
+        {
+            txg_batch_job *inline_jobs[1] = {job};
+            process_txg_jobs(t, inline_jobs, 1);
+        }
+        else
+        {
+            stage2_enqueue_job(t, job);
+        }
     }
 
     return NULL;
@@ -1599,11 +1614,23 @@ cow_tree *cow_open(const char *path)
         free(t);
         return NULL;
     }
+    if (pthread_mutex_init(&t->commit_lock, NULL) != 0)
+    {
+        perror("pthread_mutex_init commit_lock");
+        pthread_cond_destroy(&t->stage2_cv);
+        pthread_mutex_destroy(&t->stage2_lock);
+        pthread_cond_destroy(&t->q_cv);
+        pthread_mutex_destroy(&t->q_lock);
+        pthread_mutex_destroy(&t->flush_lock);
+        free(t);
+        return NULL;
+    }
 
     t->fd = zbd_open(path, O_RDWR, &t->info);
     if (t->fd < 0)
     {
         perror("zbd_open");
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
@@ -1615,6 +1642,7 @@ cow_tree *cow_open(const char *path)
     {
         perror("nvme_get_nsid");
         zbd_close(t->fd);
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
@@ -1636,6 +1664,7 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
@@ -1653,6 +1682,7 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
@@ -1696,6 +1726,7 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->stage2_cv);
         pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
@@ -1716,6 +1747,7 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->stage2_cv);
         pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
@@ -1743,6 +1775,7 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
+        pthread_mutex_destroy(&t->commit_lock);
         pthread_cond_destroy(&t->stage2_cv);
         pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
@@ -1886,6 +1919,7 @@ void cow_close(cow_tree *t)
 
     pthread_cond_destroy(&t->stage2_cv);
     pthread_mutex_destroy(&t->stage2_lock);
+    pthread_mutex_destroy(&t->commit_lock);
     pthread_cond_destroy(&t->q_cv);
     pthread_mutex_destroy(&t->q_lock);
     pthread_mutex_destroy(&t->flush_lock);
