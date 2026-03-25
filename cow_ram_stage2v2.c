@@ -7,16 +7,17 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "cow_ram_stage2.h"
+#include "cow_ram_stage2v2.h"
 
 #define MAX_HEIGHT 32
 #define RIGHTMOST_IDX UINT32_MAX
 
-#define TXG_BATCH_MAX 256
-#define TXG_BATCH_WAIT_US 150
-#define TXG_BATCH_MIN_WAIT_US 30
+#define TXG_BATCH_MAX 64
+#define TXG_BATCH_WAIT_US 100
+#define TXG_BATCH_MIN_WAIT_US 20
 #define TXG_COMMIT_MERGE_JOBS 4
-#define TXG_COMMIT_MERGE_ITEMS 512
+#define TXG_COMMIT_MERGE_ITEMS 256
+#define TXG_COALESCE_QD_MIN 8
 #define PROF_SAMPLE_MASK 1023U
 
 #define READ_CACHE_SLOTS 64
@@ -1242,12 +1243,10 @@ static pagenum_t flush_overlay_node(overlay_state *ov, node_id_t id)
 static void stage2_enqueue_job(cow_tree *t, txg_batch_job *job)
 {
     pthread_mutex_lock(&t->stage2_lock);
-
     if (t->stage2_tail)
         t->stage2_tail->next = job;
     else
         t->stage2_head = job;
-
     t->stage2_tail = job;
     pthread_cond_signal(&t->stage2_cv);
     pthread_mutex_unlock(&t->stage2_lock);
@@ -1256,9 +1255,7 @@ static void stage2_enqueue_job(cow_tree *t, txg_batch_job *job)
 static txg_batch_job *stage2_dequeue_job(cow_tree *t)
 {
     pthread_mutex_lock(&t->stage2_lock);
-
-    while (t->stage2_head == NULL &&
-           !atomic_load_explicit(&t->stop_commit, memory_order_acquire))
+    while (t->stage2_head == NULL && !atomic_load_explicit(&t->stop_commit, memory_order_acquire))
     {
         pthread_cond_wait(&t->stage2_cv, &t->stage2_lock);
     }
@@ -1270,7 +1267,6 @@ static txg_batch_job *stage2_dequeue_job(cow_tree *t)
         if (t->stage2_head == NULL)
             t->stage2_tail = NULL;
     }
-
     pthread_mutex_unlock(&t->stage2_lock);
     return job;
 }
@@ -1305,22 +1301,15 @@ static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
             t->q_tail = NULL;
         req->next = NULL;
         batch[n++] = req;
-    }
-
-    int drained = n;
-    if (drained > 0)
-    {
-        uint64_t qcur = atomic_fetch_sub_explicit(&t->stat_queue_depth_current, (uint64_t)drained, memory_order_relaxed) - (uint64_t)drained;
-        atomic_fetch_add_explicit(&t->stat_queue_depth_sum, qcur, memory_order_relaxed);
-        atomic_fetch_add_explicit(&t->stat_queue_depth_samples, 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&t->stat_queue_depth_current, 1, memory_order_relaxed);
     }
 
     if (n < max_batch && !atomic_load_explicit(&t->stop_sync, memory_order_acquire))
     {
-        uint64_t qdepth_cur = atomic_load_explicit(&t->stat_queue_depth_current, memory_order_relaxed);
-        if (n >= 4 || qdepth_cur >= 8)
+        uint64_t qdepth = atomic_load_explicit(&t->stat_queue_depth_current, memory_order_relaxed);
+        if (n >= 2 && qdepth >= TXG_COALESCE_QD_MIN)
         {
-            uint32_t wait_us = (n >= 16 || qdepth_cur >= 32) ? TXG_BATCH_WAIT_US : TXG_BATCH_MIN_WAIT_US;
+            uint32_t wait_us = (qdepth >= 32 || n >= 16) ? TXG_BATCH_WAIT_US : TXG_BATCH_MIN_WAIT_US;
 
             struct timespec now;
             clock_gettime(CLOCK_REALTIME, &now);
@@ -1335,9 +1324,7 @@ static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
                     break;
 
                 int rc = pthread_cond_timedwait(&t->q_cv, &t->q_lock, &deadline);
-                if (rc == ETIMEDOUT)
-                    break;
-                if (rc != 0)
+                if (rc == ETIMEDOUT || rc != 0)
                     break;
 
                 while (n < max_batch && t->q_head != NULL)
@@ -1348,17 +1335,10 @@ static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
                         t->q_tail = NULL;
                     req->next = NULL;
                     batch[n++] = req;
+                    atomic_fetch_sub_explicit(&t->stat_queue_depth_current, 1, memory_order_relaxed);
                 }
             }
         }
-    }
-
-    int extra = n - drained;
-    if (extra > 0)
-    {
-        uint64_t qcur = atomic_fetch_sub_explicit(&t->stat_queue_depth_current, (uint64_t)extra, memory_order_relaxed) - (uint64_t)extra;
-        atomic_fetch_add_explicit(&t->stat_queue_depth_sum, qcur, memory_order_relaxed);
-        atomic_fetch_add_explicit(&t->stat_queue_depth_samples, 1, memory_order_relaxed);
     }
 
     pthread_mutex_unlock(&t->q_lock);
@@ -1390,42 +1370,46 @@ static int cmp_batch_item(const void *a, const void *b)
     return 0;
 }
 
-static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs, int free_jobs)
+static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs)
 {
-    batch_item merged_items[TXG_COMMIT_MERGE_ITEMS];
     int merged_n = 0;
-    uint64_t start_ns = jobs[0]->start_ns;
+    batch_item merged_items[TXG_COMMIT_MERGE_ITEMS];
+    int ord = 0;
 
     for (int j = 0; j < njobs; j++)
     {
         txg_batch_job *cur = jobs[j];
-        if (cur->start_ns < start_ns)
-            start_ns = cur->start_ns;
-
-        for (int i = 0; i < cur->n; i++)
+        for (int i = 0; i < cur->n && merged_n < TXG_COMMIT_MERGE_ITEMS; i++)
         {
-            if (merged_n >= TXG_COMMIT_MERGE_ITEMS)
-                break;
-            merged_items[merged_n] = cur->items[i];
+            merged_items[merged_n].req = cur->items[i].req;
+            merged_items[merged_n].ord = ord++;
             merged_n++;
         }
     }
 
-    if (merged_n <= 0)
+    if (merged_n == 0)
     {
-        if (free_jobs)
-        {
-            for (int j = 0; j < njobs; j++)
-                free(jobs[j]);
-        }
+        for (int j = 0; j < njobs; j++)
+            free(jobs[j]);
         return;
     }
 
-    // Only sort when there are at least two items.
-    if (merged_n > 1)
-        qsort(merged_items, (size_t)merged_n, sizeof(merged_items[0]), cmp_batch_item);
+    atomic_fetch_add_explicit(&t->stat_commit_batches, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_commit_items, (uint64_t)merged_n, memory_order_relaxed);
 
-    pthread_mutex_lock(&t->commit_exec_lock);
+    int do_sample = prof_should_sample();
+    uint64_t batch_t0 = do_sample ? monotonic_ns() : 0;
+    uint64_t stage_t0 = 0;
+
+    if (do_sample)
+        stage_t0 = monotonic_ns();
+    qsort(merged_items, (size_t)merged_n, sizeof(merged_items[0]), cmp_batch_item);
+    if (do_sample)
+    {
+        uint64_t dt = monotonic_ns() - stage_t0;
+        atomic_fetch_add_explicit(&t->stat_sort_latency_ns_sum, dt, memory_order_relaxed);
+        atomic_fetch_add_explicit(&t->stat_sort_latency_ns_samples, 1, memory_order_relaxed);
+    }
 
     pagenum_t root;
     uint64_t seq;
@@ -1437,18 +1421,27 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs, int f
     ov.t = t;
 
     node_id_t root_id = root;
-    uint64_t apply_t0 = monotonic_ns();
+    if (do_sample)
+        stage_t0 = monotonic_ns();
     for (int i = 0; i < merged_n; i++)
+    {
         apply_insert_overlay(&ov, &root_id, merged_items[i].req->key, merged_items[i].req->value);
-    uint64_t apply_dt = monotonic_ns() - apply_t0;
-    atomic_fetch_add_explicit(&t->stat_apply_latency_ns_sum, apply_dt, memory_order_relaxed);
-    atomic_fetch_add_explicit(&t->stat_apply_latency_ns_samples, 1, memory_order_relaxed);
+    }
+    if (do_sample)
+    {
+        uint64_t dt = monotonic_ns() - stage_t0;
+        atomic_fetch_add_explicit(&t->stat_apply_latency_ns_sum, dt, memory_order_relaxed);
+        atomic_fetch_add_explicit(&t->stat_apply_latency_ns_samples, 1, memory_order_relaxed);
+        stage_t0 = monotonic_ns();
+    }
 
-    uint64_t flush_t0 = monotonic_ns();
     pagenum_t new_root = (root_id == INVALID_PGN) ? INVALID_PGN : flush_overlay_node(&ov, root_id);
-    uint64_t flush_dt = monotonic_ns() - flush_t0;
-    atomic_fetch_add_explicit(&t->stat_flush_latency_ns_sum, flush_dt, memory_order_relaxed);
-    atomic_fetch_add_explicit(&t->stat_flush_latency_ns_samples, 1, memory_order_relaxed);
+    if (do_sample)
+    {
+        uint64_t dt = monotonic_ns() - stage_t0;
+        atomic_fetch_add_explicit(&t->stat_flush_latency_ns_sum, dt, memory_order_relaxed);
+        atomic_fetch_add_explicit(&t->stat_flush_latency_ns_samples, 1, memory_order_relaxed);
+    }
 
     atomic_fetch_add_explicit(&t->stat_overlay_nodes_sum, (uint64_t)ov.len, memory_order_relaxed);
     stat_update_max_u64(&t->stat_overlay_nodes_max, (uint64_t)ov.len);
@@ -1457,20 +1450,17 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs, int f
 
     publish_root_single_writer(t, new_root);
 
-    uint64_t txg_dt = monotonic_ns() - start_ns;
-    atomic_fetch_add_explicit(&t->stat_batch_latency_ns_sum, txg_dt, memory_order_relaxed);
-    atomic_fetch_add_explicit(&t->stat_batch_latency_ns_samples, 1, memory_order_relaxed);
-
-    pthread_mutex_unlock(&t->commit_exec_lock);
+    if (do_sample)
+    {
+        uint64_t dt = monotonic_ns() - batch_t0;
+        atomic_fetch_add_explicit(&t->stat_batch_latency_ns_sum, dt, memory_order_relaxed);
+        atomic_fetch_add_explicit(&t->stat_batch_latency_ns_samples, 1, memory_order_relaxed);
+    }
 
     for (int i = 0; i < merged_n; i++)
         complete_req(merged_items[i].req);
-
-    if (free_jobs)
-    {
-        for (int j = 0; j < njobs; j++)
-            free(jobs[j]);
-    }
+    for (int j = 0; j < njobs; j++)
+        free(jobs[j]);
 }
 
 static void *txg_batch_main(void *arg)
@@ -1480,40 +1470,20 @@ static void *txg_batch_main(void *arg)
 
     for (;;)
     {
-        uint64_t txg_t0 = monotonic_ns();
         int n = pop_batch(t, batch, TXG_BATCH_MAX);
         if (n == 0)
             break;
 
-        int inline_fast = 0;
-        if (n <= 2)
+        txg_batch_job *job = malloc(sizeof(*job));
+        if (!job)
         {
-            uint64_t qdepth_cur = atomic_load_explicit(&t->stat_queue_depth_current, memory_order_relaxed);
-            int stage2_empty;
-            pthread_mutex_lock(&t->stage2_lock);
-            stage2_empty = (t->stage2_head == NULL);
-            pthread_mutex_unlock(&t->stage2_lock);
-            inline_fast = (stage2_empty && qdepth_cur <= 2);
+            perror("malloc txg_batch_job");
+            exit(EXIT_FAILURE);
         }
 
-        txg_batch_job inline_job;
-        txg_batch_job *job = &inline_job;
-        if (!inline_fast)
-        {
-            job = malloc(sizeof(*job));
-            if (!job)
-            {
-                perror("malloc txg_batch_job");
-                exit(EXIT_FAILURE);
-            }
-        }
-
-        job->start_ns = txg_t0;
+        job->start_ns = monotonic_ns();
         job->n = n;
         job->next = NULL;
-
-        atomic_fetch_add_explicit(&t->stat_batches, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&t->stat_batch_items, (uint64_t)n, memory_order_relaxed);
 
         for (int i = 0; i < n; i++)
         {
@@ -1521,27 +1491,12 @@ static void *txg_batch_main(void *arg)
             job->items[i].ord = i;
         }
 
-        uint64_t sort_t0 = monotonic_ns();
-        if (n > 1)
-            qsort(job->items, (size_t)n, sizeof(job->items[0]), cmp_batch_item);
-        uint64_t sort_dt = monotonic_ns() - sort_t0;
-        atomic_fetch_add_explicit(&t->stat_sort_latency_ns_sum, sort_dt, memory_order_relaxed);
-        atomic_fetch_add_explicit(&t->stat_sort_latency_ns_samples, 1, memory_order_relaxed);
-
-        if (inline_fast)
-        {
-            txg_batch_job *single[1] = {job};
-            process_txg_jobs(t, single, 1, 0);
-            continue;
-        }
+        qsort(job->items, (size_t)n, sizeof(job->items[0]), cmp_batch_item);
+        atomic_fetch_add_explicit(&t->stat_batches, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&t->stat_batch_items, (uint64_t)n, memory_order_relaxed);
 
         stage2_enqueue_job(t, job);
     }
-
-    atomic_store_explicit(&t->stop_commit, true, memory_order_release);
-    pthread_mutex_lock(&t->stage2_lock);
-    pthread_cond_broadcast(&t->stage2_cv);
-    pthread_mutex_unlock(&t->stage2_lock);
 
     return NULL;
 }
@@ -1562,17 +1517,17 @@ static void *txg_commit_main(void *arg)
         }
 
         int njobs = 1;
-        int planned_items = job->n;
+        int merged_n = job->n;
         jobs[0] = job;
 
         for (;;)
         {
-            if (njobs >= TXG_COMMIT_MERGE_JOBS)
+            if (njobs >= TXG_COMMIT_MERGE_JOBS || merged_n >= TXG_COMMIT_MERGE_ITEMS)
                 break;
 
             pthread_mutex_lock(&t->stage2_lock);
             txg_batch_job *next = t->stage2_head;
-            if (!next || (planned_items + next->n) > TXG_COMMIT_MERGE_ITEMS)
+            if (!next || merged_n + next->n > TXG_COMMIT_MERGE_ITEMS)
             {
                 pthread_mutex_unlock(&t->stage2_lock);
                 break;
@@ -1583,11 +1538,12 @@ static void *txg_commit_main(void *arg)
                 t->stage2_tail = NULL;
             pthread_mutex_unlock(&t->stage2_lock);
 
+            next->next = NULL;
             jobs[njobs++] = next;
-            planned_items += next->n;
+            merged_n += next->n;
         }
 
-        process_txg_jobs(t, jobs, njobs, 1);
+        process_txg_jobs(t, jobs, njobs);
     }
 
     return NULL;
@@ -1643,28 +1599,14 @@ cow_tree *cow_open(const char *path)
         free(t);
         return NULL;
     }
-    if (pthread_mutex_init(&t->commit_exec_lock, NULL) != 0)
-    {
-        perror("pthread_mutex_init commit_exec_lock");
-        pthread_cond_destroy(&t->stage2_cv);
-        pthread_mutex_destroy(&t->stage2_lock);
-        pthread_cond_destroy(&t->q_cv);
-        pthread_mutex_destroy(&t->q_lock);
-        pthread_mutex_destroy(&t->flush_lock);
-        free(t);
-        return NULL;
-    }
 
     t->fd = zbd_open(path, O_RDWR, &t->info);
     if (t->fd < 0)
     {
         perror("zbd_open");
-        pthread_cond_destroy(&t->stage2_cv);
-        pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
-        pthread_mutex_destroy(&t->commit_exec_lock);
         free(t);
         return NULL;
     }
@@ -1673,12 +1615,9 @@ cow_tree *cow_open(const char *path)
     {
         perror("nvme_get_nsid");
         zbd_close(t->fd);
-        pthread_cond_destroy(&t->stage2_cv);
-        pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
-        pthread_mutex_destroy(&t->commit_exec_lock);
         free(t);
         return NULL;
     }
@@ -1697,12 +1636,9 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
-        pthread_cond_destroy(&t->stage2_cv);
-        pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
-        pthread_mutex_destroy(&t->commit_exec_lock);
         free(t);
         return NULL;
     }
@@ -1717,12 +1653,9 @@ cow_tree *cow_open(const char *path)
         if (t->direct_fd >= 0)
             close(t->direct_fd);
         zbd_close(t->fd);
-        pthread_cond_destroy(&t->stage2_cv);
-        pthread_mutex_destroy(&t->stage2_lock);
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
-        pthread_mutex_destroy(&t->commit_exec_lock);
         free(t);
         return NULL;
     }
@@ -1749,16 +1682,14 @@ cow_tree *cow_open(const char *path)
     }
     atomic_store_explicit(&t->current_zone, initial_zone, memory_order_release);
 
-    t->stage2_head = NULL;
-    t->stage2_tail = NULL;
     atomic_store_explicit(&t->dirty, false, memory_order_release);
     atomic_store_explicit(&t->flusher_stop, false, memory_order_release);
     atomic_store_explicit(&t->stop_sync, false, memory_order_release);
     atomic_store_explicit(&t->stop_commit, false, memory_order_release);
 
-    if (pthread_create(&t->commit_tid, NULL, txg_commit_main, t) != 0)
+    if (pthread_create(&t->flusher_tid, NULL, sb_flusher_thread, t) != 0)
     {
-        perror("pthread_create txg_commit_main");
+        perror("pthread_create flusher");
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
@@ -1770,47 +1701,42 @@ cow_tree *cow_open(const char *path)
         pthread_cond_destroy(&t->q_cv);
         pthread_mutex_destroy(&t->q_lock);
         pthread_mutex_destroy(&t->flush_lock);
-        pthread_mutex_destroy(&t->commit_exec_lock);
+        free(t);
+        return NULL;
+    }
+
+    if (pthread_create(&t->commit_tid, NULL, txg_commit_main, t) != 0)
+    {
+        perror("pthread_create commit");
+        atomic_store_explicit(&t->flusher_stop, true, memory_order_release);
+        pthread_join(t->flusher_tid, NULL);
+        free(t->zones);
+        free(t->zone_wp_bytes);
+        free(t->zone_full);
+        if (t->direct_fd >= 0)
+            close(t->direct_fd);
+        zbd_close(t->fd);
+        pthread_cond_destroy(&t->stage2_cv);
+        pthread_mutex_destroy(&t->stage2_lock);
+        pthread_cond_destroy(&t->q_cv);
+        pthread_mutex_destroy(&t->q_lock);
+        pthread_mutex_destroy(&t->flush_lock);
         free(t);
         return NULL;
     }
 
     if (pthread_create(&t->sync_tid, NULL, txg_batch_main, t) != 0)
     {
-        perror("pthread_create txg_batch_main");
+        perror("pthread_create sync");
         atomic_store_explicit(&t->stop_commit, true, memory_order_release);
         pthread_mutex_lock(&t->stage2_lock);
         pthread_cond_broadcast(&t->stage2_cv);
         pthread_mutex_unlock(&t->stage2_lock);
         pthread_join(t->commit_tid, NULL);
-        free(t->zones);
-        free(t->zone_wp_bytes);
-        free(t->zone_full);
-        if (t->direct_fd >= 0)
-            close(t->direct_fd);
-        zbd_close(t->fd);
-        pthread_cond_destroy(&t->stage2_cv);
-        pthread_mutex_destroy(&t->stage2_lock);
-        pthread_cond_destroy(&t->q_cv);
-        pthread_mutex_destroy(&t->q_lock);
-        pthread_mutex_destroy(&t->flush_lock);
-        free(t);
-        return NULL;
-    }
 
-    if (pthread_create(&t->flusher_tid, NULL, sb_flusher_thread, t) != 0)
-    {
-        perror("pthread_create flusher");
-        atomic_store_explicit(&t->stop_sync, true, memory_order_release);
-        pthread_mutex_lock(&t->q_lock);
-        pthread_cond_broadcast(&t->q_cv);
-        pthread_mutex_unlock(&t->q_lock);
-        pthread_join(t->sync_tid, NULL);
-        atomic_store_explicit(&t->stop_commit, true, memory_order_release);
-        pthread_mutex_lock(&t->stage2_lock);
-        pthread_cond_broadcast(&t->stage2_cv);
-        pthread_mutex_unlock(&t->stage2_lock);
-        pthread_join(t->commit_tid, NULL);
+        atomic_store_explicit(&t->flusher_stop, true, memory_order_release);
+        pthread_join(t->flusher_tid, NULL);
+
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
@@ -1854,15 +1780,17 @@ void cow_close(cow_tree *t)
 
         uint64_t qwait_ins_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_insert, memory_order_relaxed);
         uint64_t qwait_ins_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_insert, memory_order_relaxed);
-        uint64_t qwait_w_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_sync, memory_order_relaxed);
-        uint64_t qwait_w_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_sync, memory_order_relaxed);
+        uint64_t qwait_sync_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_sync, memory_order_relaxed);
+        uint64_t qwait_sync_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_sync, memory_order_relaxed);
 
         uint64_t batches = atomic_load_explicit(&t->stat_batches, memory_order_relaxed);
         uint64_t batch_items = atomic_load_explicit(&t->stat_batch_items, memory_order_relaxed);
+        uint64_t commit_batches = atomic_load_explicit(&t->stat_commit_batches, memory_order_relaxed);
+        uint64_t commit_items = atomic_load_explicit(&t->stat_commit_items, memory_order_relaxed);
         uint64_t qdepth_samples = atomic_load_explicit(&t->stat_queue_depth_samples, memory_order_relaxed);
         uint64_t qdepth_sum = atomic_load_explicit(&t->stat_queue_depth_sum, memory_order_relaxed);
         uint64_t qdepth_max = atomic_load_explicit(&t->stat_queue_depth_max, memory_order_relaxed);
-        uint64_t writer_empty_waits = atomic_load_explicit(&t->stat_sync_idle_waits, memory_order_relaxed);
+        uint64_t sync_idle_waits = atomic_load_explicit(&t->stat_sync_idle_waits, memory_order_relaxed);
         uint64_t overlay_nodes_sum = atomic_load_explicit(&t->stat_overlay_nodes_sum, memory_order_relaxed);
         uint64_t overlay_nodes_max = atomic_load_explicit(&t->stat_overlay_nodes_max, memory_order_relaxed);
         uint64_t append_retries = atomic_load_explicit(&t->stat_append_retries, memory_order_relaxed);
@@ -1881,12 +1809,13 @@ void cow_close(cow_tree *t)
         double qwait_ins_avg_us = (qwait_ins_samples > 0)
                                       ? ((double)qwait_ins_ns / (double)qwait_ins_samples / 1000.0)
                                       : 0.0;
-        double qwait_w_avg_us = (qwait_w_samples > 0)
-                                    ? ((double)qwait_w_ns / (double)qwait_w_samples / 1000.0)
-                                    : 0.0;
+        double qwait_sync_avg_us = (qwait_sync_samples > 0)
+                                       ? ((double)qwait_sync_ns / (double)qwait_sync_samples / 1000.0)
+                                       : 0.0;
         double avg_batch_size = (batches > 0) ? ((double)batch_items / (double)batches) : 0.0;
+        double avg_commit_batch_size = (commit_batches > 0) ? ((double)commit_items / (double)commit_batches) : 0.0;
         double avg_qdepth = (qdepth_samples > 0) ? ((double)qdepth_sum / (double)qdepth_samples) : 0.0;
-        double avg_overlay_nodes = (batches > 0) ? ((double)overlay_nodes_sum / (double)batches) : 0.0;
+        double avg_overlay_nodes = (commit_batches > 0) ? ((double)overlay_nodes_sum / (double)commit_batches) : 0.0;
         double append_lat_avg_us = (append_lat_ns_samples > 0) ? ((double)append_lat_ns_sum / (double)append_lat_ns_samples / 1000.0) : 0.0;
         double batch_lat_avg_us = (batch_lat_ns_samples > 0) ? ((double)batch_lat_ns_sum / (double)batch_lat_ns_samples / 1000.0) : 0.0;
         double sort_lat_avg_us = (sort_lat_ns_samples > 0) ? ((double)sort_lat_ns_sum / (double)sort_lat_ns_samples / 1000.0) : 0.0;
@@ -1894,32 +1823,36 @@ void cow_close(cow_tree *t)
         double flush_lat_avg_us = (flush_lat_ns_samples > 0) ? ((double)flush_lat_ns_sum / (double)flush_lat_ns_samples / 1000.0) : 0.0;
 
         fprintf(stderr,
-                "[ram_stage2] page_cache tl_hit=%lu ram_hit=%lu disk_reads=%lu\n"
-                "[ram_stage2] q_lock_wait_avg_us insert=%.2f sync=%.2f\n"
-                "[ram_stage2] avg_batch_size=%.2f batches=%lu items=%lu\n"
-                "[ram_stage2] queue_depth avg=%.2f max=%lu sync_idle_waits=%lu\n"
-                "[ram_stage2] overlay_nodes avg=%.2f max=%lu\n"
-                "[ram_stage2] append_retries=%lu zone_rotations=%lu\n"
-                "[ram_stage2] sampled_latency_us append=%.2f txg=%.2f\n"
-                "[ram_stage2] sampled_stage_us sort=%.2f apply=%.2f flush=%.2f\n"
-                "[ram_stage2] page_appends=%lu\n",
+                "[ram_stage2v2] page_cache tl_hit=%lu ram_hit=%lu disk_reads=%lu\n"
+                "[ram_stage2v2] q_lock_wait_avg_us insert=%.2f sync=%.2f\n"
+                "[ram_stage2v2] avg_batch_size=%.2f batches=%lu items=%lu\n"
+                "[ram_stage2v2] avg_commit_batch_size=%.2f commit_batches=%lu commit_items=%lu\n"
+                "[ram_stage2v2] queue_depth avg=%.2f max=%lu sync_idle_waits=%lu\n"
+                "[ram_stage2v2] overlay_nodes avg=%.2f max=%lu\n"
+                "[ram_stage2v2] append_retries=%lu zone_rotations=%lu\n"
+                "[ram_stage2v2] sampled_latency_us append=%.2f batch=%.2f\n"
+                "[ram_stage2v2] sampled_stage_us sort=%.2f apply=%.2f flush=%.2f\n"
+                "[ram_stage2v2] page_appends=%lu\n",
                 (unsigned long)tl_hit,
                 (unsigned long)ram_hit,
                 (unsigned long)disk_reads,
                 qwait_ins_avg_us,
-                qwait_w_avg_us,
+                qwait_sync_avg_us,
                 avg_batch_size,
                 (unsigned long)batches,
                 (unsigned long)batch_items,
-            avg_qdepth,
-            (unsigned long)qdepth_max,
-            (unsigned long)writer_empty_waits,
-            avg_overlay_nodes,
-            (unsigned long)overlay_nodes_max,
-            (unsigned long)append_retries,
-            (unsigned long)zone_rotations,
-            append_lat_avg_us,
-            batch_lat_avg_us,
+                avg_commit_batch_size,
+                (unsigned long)commit_batches,
+                (unsigned long)commit_items,
+                avg_qdepth,
+                (unsigned long)qdepth_max,
+                (unsigned long)sync_idle_waits,
+                avg_overlay_nodes,
+                (unsigned long)overlay_nodes_max,
+                (unsigned long)append_retries,
+                (unsigned long)zone_rotations,
+                append_lat_avg_us,
+                batch_lat_avg_us,
                 sort_lat_avg_us,
                 apply_lat_avg_us,
                 flush_lat_avg_us,
@@ -1951,10 +1884,9 @@ void cow_close(cow_tree *t)
     free(t->zone_full);
     zbd_close(t->fd);
 
-    pthread_cond_destroy(&t->q_cv);
     pthread_cond_destroy(&t->stage2_cv);
     pthread_mutex_destroy(&t->stage2_lock);
-    pthread_mutex_destroy(&t->commit_exec_lock);
+    pthread_cond_destroy(&t->q_cv);
     pthread_mutex_destroy(&t->q_lock);
     pthread_mutex_destroy(&t->flush_lock);
 

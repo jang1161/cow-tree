@@ -122,6 +122,7 @@ typedef struct
 
     pthread_t sync_tid;
     pthread_t commit_tid;
+
     pthread_mutex_t q_lock;
     pthread_cond_t q_cv;
     insert_req *q_head;
@@ -131,7 +132,6 @@ typedef struct
     pthread_cond_t stage2_cv;
     txg_batch_job *stage2_head;
     txg_batch_job *stage2_tail;
-    pthread_mutex_t commit_exec_lock;
 
     _Atomic(bool) stop_sync;
     _Atomic(bool) stop_commit;
@@ -148,6 +148,8 @@ typedef struct
 
     _Atomic(uint64_t) stat_batches;
     _Atomic(uint64_t) stat_batch_items;
+    _Atomic(uint64_t) stat_commit_batches;
+    _Atomic(uint64_t) stat_commit_items;
 
     _Atomic(uint64_t) stat_queue_depth_current;
     _Atomic(uint64_t) stat_queue_depth_samples;
