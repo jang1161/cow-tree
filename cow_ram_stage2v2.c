@@ -18,8 +18,8 @@
 #define TXG_COMMIT_MERGE_JOBS 4
 #define TXG_COMMIT_MERGE_ITEMS 256
 #define TXG_COALESCE_QD_MIN 8
-#define TXG_INLINE_QD_MAX 2
-#define TXG_INLINE_ITEMS_MAX 8
+#define TXG_INLINE_QD_MAX 0
+#define TXG_INLINE_ITEMS_MAX 1
 #define PROF_SAMPLE_MASK 1023U
 
 #define READ_CACHE_SLOTS 64
@@ -1273,6 +1273,15 @@ static txg_batch_job *stage2_dequeue_job(cow_tree *t)
     return job;
 }
 
+static int stage2_queue_empty(cow_tree *t)
+{
+    int empty;
+    pthread_mutex_lock(&t->stage2_lock);
+    empty = (t->stage2_head == NULL);
+    pthread_mutex_unlock(&t->stage2_lock);
+    return empty;
+}
+
 static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
 {
     int n = 0;
@@ -1502,7 +1511,7 @@ static void *txg_batch_main(void *arg)
         atomic_fetch_add_explicit(&t->stat_batch_items, (uint64_t)n, memory_order_relaxed);
 
         uint64_t qd_now = atomic_load_explicit(&t->stat_queue_depth_current, memory_order_relaxed);
-        if (n <= TXG_INLINE_ITEMS_MAX && qd_now <= TXG_INLINE_QD_MAX)
+        if (n <= TXG_INLINE_ITEMS_MAX && qd_now <= TXG_INLINE_QD_MAX && stage2_queue_empty(t))
         {
             txg_batch_job *inline_jobs[1] = {job};
             process_txg_jobs(t, inline_jobs, 1);
