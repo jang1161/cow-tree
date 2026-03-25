@@ -6,7 +6,16 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(COW_BTRFS1)
+#include "cow_btrfs1.h"
+#elif defined(COW_BTRFS2)
+#include "cow_btrfs2.h"
+#elif defined(COW_BTRFS3)
+#include "cow_btrfs3.h"
+#else
 #include "cow_ram_stage2v2.h"
+#endif
 
 #define PROGRESS_STEP 1000
 
