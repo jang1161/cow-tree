@@ -143,6 +143,14 @@ int main(int argc, char *argv[])
     }
 
     printf("Random key set generated (%d keys).\n", total_keys);
+    printf("Resetting ZNS device...\n");
+    char cmd[256];
+    sprintf(cmd, "sudo nvme zns reset-zone -a %s", dev_path);
+    int rc = system(cmd);
+    if (rc == -1)
+    {
+        perror("system");
+    }
 
     int thread_counts[] = {1, 2, 4, 8, 16, 32, 64};
     int num_configs = sizeof(thread_counts) / sizeof(thread_counts[0]);
