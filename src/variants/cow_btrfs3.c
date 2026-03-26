@@ -20,6 +20,8 @@
 #define READ_CACHE_SLOTS 64
 #define RAM_TABLE_INIT_CAP 65536
 #define TEMP_NODE_BIT (1ULL << 63)
+#define NODE_LOCK_STRIPES 1024
+#define TX_APPLY_WORKERS_MAX 8
 
 typedef uint64_t node_id_t;
 
@@ -49,6 +51,9 @@ typedef struct
     size_t *idx_table;
     size_t idx_cap;
     size_t idx_used;
+    pthread_mutex_t map_lock;
+    pthread_mutex_t root_lock;
+    pthread_mutex_t node_locks[NODE_LOCK_STRIPES];
 } overlay_state;
 
 typedef struct
@@ -821,6 +826,73 @@ static void tx_free(transaction_t *tx)
     free(tx);
 }
 
+static void tx_start_or_join(cow_tree *t, transaction_t **out_tx)
+{
+    pthread_mutex_lock(&t->tx_lock);
+
+    transaction_t *tx = t->current_tx;
+    if (!tx || tx->state != TX_RUNNING)
+    {
+        uint64_t new_tx_id = atomic_fetch_add_explicit(&t->current_tx_id, 1, memory_order_relaxed);
+        tx = tx_alloc(new_tx_id);
+        if (!tx)
+        {
+            pthread_mutex_unlock(&t->tx_lock);
+            fprintf(stderr, "tx_alloc failed\n");
+            exit(EXIT_FAILURE);
+        }
+        t->current_tx = tx;
+        atomic_fetch_add_explicit(&t->stat_tx_starts, 1, memory_order_relaxed);
+    }
+
+    tx->num_writers++;
+    atomic_fetch_add_explicit(&t->stat_tx_joins, 1, memory_order_relaxed);
+
+    pthread_mutex_unlock(&t->tx_lock);
+    *out_tx = tx;
+}
+
+static void tx_leave_participant(transaction_t *tx)
+{
+    pthread_mutex_lock(&tx->state_lock);
+    if (tx->num_writers > 0)
+        tx->num_writers--;
+    pthread_cond_broadcast(&tx->commit_cv);
+    pthread_mutex_unlock(&tx->state_lock);
+}
+
+static int tx_try_become_winner(cow_tree *t, transaction_t *tx)
+{
+    (void)t;
+    pthread_mutex_lock(&tx->state_lock);
+
+    tx->num_writers--;
+    if (tx->num_writers > 0)
+    {
+        while (tx->state == TX_RUNNING && tx->num_writers > 0)
+        {
+            pthread_cond_wait(&tx->commit_cv, &tx->state_lock);
+        }
+        pthread_mutex_unlock(&tx->state_lock);
+        return 0;
+    }
+
+    tx->state = TX_COMMIT_PREP;
+    pthread_cond_broadcast(&tx->commit_cv);
+    pthread_mutex_unlock(&tx->state_lock);
+    return 1;
+}
+
+static void tx_wait_commit(transaction_t *tx)
+{
+    pthread_mutex_lock(&tx->state_lock);
+    while (tx->state != TX_COMPLETED)
+    {
+        pthread_cond_wait(&tx->observer_cv, &tx->state_lock);
+    }
+    pthread_mutex_unlock(&tx->state_lock);
+}
+
 static void tx_commit_doing(transaction_t *tx)
 {
     pthread_mutex_lock(&tx->state_lock);
@@ -854,6 +926,44 @@ static inline uint64_t overlay_hash_u64(uint64_t x)
     x *= 0x94d049bb133111ebULL;
     x ^= x >> 31;
     return x;
+}
+
+static inline pthread_mutex_t *overlay_node_lock(overlay_state *ov, node_id_t id)
+{
+    uint64_t h = overlay_hash_u64((uint64_t)id);
+    return &ov->node_locks[h & (NODE_LOCK_STRIPES - 1)];
+}
+
+static void overlay_init_locks(overlay_state *ov)
+{
+    if (pthread_mutex_init(&ov->map_lock, NULL) != 0)
+    {
+        perror("pthread_mutex_init ov.map_lock");
+        exit(EXIT_FAILURE);
+    }
+    if (pthread_mutex_init(&ov->root_lock, NULL) != 0)
+    {
+        perror("pthread_mutex_init ov.root_lock");
+        exit(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < NODE_LOCK_STRIPES; i++)
+    {
+        if (pthread_mutex_init(&ov->node_locks[i], NULL) != 0)
+        {
+            perror("pthread_mutex_init ov.node_lock");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+static void overlay_destroy_locks(overlay_state *ov)
+{
+    pthread_mutex_destroy(&ov->root_lock);
+    pthread_mutex_destroy(&ov->map_lock);
+    for (size_t i = 0; i < NODE_LOCK_STRIPES; i++)
+    {
+        pthread_mutex_destroy(&ov->node_locks[i]);
+    }
 }
 
 static void overlay_index_grow(overlay_state *ov)
@@ -933,15 +1043,8 @@ static overlay_node *overlay_add_node(overlay_state *ov, node_id_t id, const pag
 {
     if (ov->len == ov->cap)
     {
-        size_t new_cap = ov->cap ? ov->cap * 2 : 256;
-        overlay_node *next = realloc(ov->arr, new_cap * sizeof(*next));
-        if (!next)
-        {
-            perror("realloc overlay");
-            exit(EXIT_FAILURE);
-        }
-        ov->arr = next;
-        ov->cap = new_cap;
+        fprintf(stderr, "overlay capacity exceeded (%zu)\n", ov->cap);
+        exit(EXIT_FAILURE);
     }
 
     size_t idx = ov->len;
@@ -961,26 +1064,36 @@ static overlay_node *overlay_add_node(overlay_state *ov, node_id_t id, const pag
 
 static overlay_node *overlay_get_mut(overlay_state *ov, node_id_t id)
 {
+    pthread_mutex_lock(&ov->map_lock);
     int idx = overlay_find_idx(ov, id);
     if (idx >= 0)
-        return &ov->arr[idx];
+    {
+        overlay_node *ret = &ov->arr[idx];
+        pthread_mutex_unlock(&ov->map_lock);
+        return ret;
+    }
 
     if (is_temp_id(id))
     {
+        pthread_mutex_unlock(&ov->map_lock);
         return NULL;
     }
 
     page p;
     load_page(ov->t, (pagenum_t)id, &p);
-    return overlay_add_node(ov, id, &p);
+    overlay_node *ret = overlay_add_node(ov, id, &p);
+    pthread_mutex_unlock(&ov->map_lock);
+    return ret;
 }
 
 static node_id_t overlay_new_temp(overlay_state *ov, uint32_t is_leaf)
 {
+    pthread_mutex_lock(&ov->map_lock);
     node_id_t id = make_temp_id(++ov->next_temp);
     overlay_node *n = overlay_add_node(ov, id, NULL);
     n->node.is_leaf = is_leaf;
     n->dirty = 1;
+    pthread_mutex_unlock(&ov->map_lock);
     return id;
 }
 
@@ -1007,9 +1120,11 @@ static uint32_t get_position(page *p, int64_t key)
 
 static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t key, const char *value)
 {
+    pthread_mutex_lock(&ov->root_lock);
     if (*root_id == INVALID_PGN)
     {
         node_id_t rid = overlay_new_temp(ov, 1);
+        pthread_mutex_lock(overlay_node_lock(ov, rid));
         overlay_node *r = overlay_get_mut(ov, rid);
         r->node.num_keys = 1;
         r->node.pointer = INVALID_PGN;
@@ -1017,18 +1132,28 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         memcpy(r->node.leaf[0].record.value, value, 120);
         r->dirty = 1;
         *root_id = rid;
+        pthread_mutex_unlock(overlay_node_lock(ov, rid));
+        pthread_mutex_unlock(&ov->root_lock);
         return;
     }
+    node_id_t cur_root = *root_id;
+    pthread_mutex_unlock(&ov->root_lock);
 
     overlay_path path;
     path.depth = 0;
 
-    node_id_t cur = *root_id;
+    node_id_t cur = cur_root;
+    pthread_mutex_t *held_lock = NULL;
     while (1)
     {
+        pthread_mutex_t *cur_lock = overlay_node_lock(ov, cur);
+        pthread_mutex_lock(cur_lock);
+        held_lock = cur_lock;
+
         overlay_node *n = overlay_get_mut(ov, cur);
         if (!n)
         {
+            pthread_mutex_unlock(cur_lock);
             fprintf(stderr, "overlay: missing node %lu\n", (unsigned long)cur);
             exit(EXIT_FAILURE);
         }
@@ -1058,7 +1183,12 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         path.e[path.depth].cidx = idx;
         path.depth++;
 
-        cur = (idx == RIGHTMOST_IDX) ? n->node.pointer : n->node.internal[idx].child;
+        node_id_t next = (idx == RIGHTMOST_IDX) ? n->node.pointer : n->node.internal[idx].child;
+        pthread_mutex_t *next_lock = overlay_node_lock(ov, next);
+        pthread_mutex_lock(next_lock);
+        pthread_mutex_unlock(cur_lock);
+        held_lock = next_lock;
+        cur = next;
     }
 
     overlay_node *leaf_n = overlay_get_mut(ov, cur);
@@ -1070,6 +1200,8 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         {
             memcpy(leaf->leaf[i].record.value, value, 120);
             leaf_n->dirty = 1;
+            if (held_lock)
+                pthread_mutex_unlock(held_lock);
             return;
         }
     }
@@ -1113,6 +1245,7 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         leaf->num_keys = sp;
 
         node_id_t right_id = overlay_new_temp(ov, 1);
+        pthread_mutex_lock(overlay_node_lock(ov, right_id));
         overlay_node *right_n = overlay_get_mut(ov, right_id);
         right_n->node.num_keys = LEAF_ORDER - sp;
         for (uint32_t i = 0; i < LEAF_ORDER - sp; i++)
@@ -1128,11 +1261,17 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         carry_split = 1;
         carry_right = right_id;
         carry_key = (int64_t)right_n->node.leaf[0].key;
+        pthread_mutex_unlock(overlay_node_lock(ov, right_id));
     }
+
+    if (held_lock)
+        pthread_mutex_unlock(held_lock);
 
     while (path.depth > 0)
     {
         overlay_path_entry pe = path.e[--path.depth];
+        pthread_mutex_t *par_lock = overlay_node_lock(ov, pe.id);
+        pthread_mutex_lock(par_lock);
         overlay_node *par_n = overlay_get_mut(ov, pe.id);
         page *par = &par_n->node;
 
@@ -1148,6 +1287,7 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         {
             par_n->dirty = 1;
             carry_left = pe.id;
+            pthread_mutex_unlock(par_lock);
             continue;
         }
 
@@ -1171,6 +1311,7 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
 
             carry_split = 0;
             carry_left = pe.id;
+            pthread_mutex_unlock(par_lock);
             continue;
         }
 
@@ -1205,6 +1346,7 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         par_n->dirty = 1;
 
         node_id_t right_id = overlay_new_temp(ov, 0);
+        pthread_mutex_lock(overlay_node_lock(ov, right_id));
         overlay_node *right_n = overlay_get_mut(ov, right_id);
         for (uint32_t j = sp; j < INTERNAL_ORDER; j++)
         {
@@ -1219,18 +1361,24 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         carry_left = pe.id;
         carry_right = right_id;
         carry_key = up_key;
+        pthread_mutex_unlock(overlay_node_lock(ov, right_id));
+        pthread_mutex_unlock(par_lock);
     }
 
     if (carry_split)
     {
         node_id_t new_root_id = overlay_new_temp(ov, 0);
+        pthread_mutex_lock(overlay_node_lock(ov, new_root_id));
         overlay_node *r = overlay_get_mut(ov, new_root_id);
         r->node.num_keys = 1;
         r->node.internal[0].key = (uint64_t)carry_key;
         r->node.internal[0].child = carry_left;
         r->node.pointer = carry_right;
         r->dirty = 1;
+        pthread_mutex_lock(&ov->root_lock);
         *root_id = new_root_id;
+        pthread_mutex_unlock(&ov->root_lock);
+        pthread_mutex_unlock(overlay_node_lock(ov, new_root_id));
     }
 }
 
@@ -1403,6 +1551,31 @@ typedef struct
     int ord;
 } batch_item;
 
+typedef struct
+{
+    cow_tree *t;
+    overlay_state *ov;
+    node_id_t *root_id;
+    batch_item *sorted;
+    int begin;
+    int end;
+} tx_apply_worker_arg;
+
+static void *tx_apply_worker_main(void *arg)
+{
+    tx_apply_worker_arg *wa = (tx_apply_worker_arg *)arg;
+    transaction_t *tx = NULL;
+    tx_start_or_join(wa->t, &tx);
+
+    for (int i = wa->begin; i < wa->end; i++)
+    {
+        apply_insert_overlay(wa->ov, wa->root_id, wa->sorted[i].req->key, wa->sorted[i].req->value);
+    }
+
+    tx_leave_participant(tx);
+    return NULL;
+}
+
 static int cmp_batch_item(const void *a, const void *b)
 {
     const batch_item *x = (const batch_item *)a;
@@ -1436,19 +1609,6 @@ static void *writer_main(void *arg)
         if (n == 0)
             break;
 
-        /* Create transaction for this batch */
-        uint64_t new_tx_id = atomic_fetch_add_explicit(&t->current_tx_id, 1, memory_order_relaxed);
-        transaction_t *tx = tx_alloc(new_tx_id);
-        if (!tx)
-        {
-            fprintf(stderr, "tx_alloc failed in writer_main\n");
-            exit(EXIT_FAILURE);
-        }
-        pthread_mutex_lock(&t->tx_lock);
-        t->current_tx = tx;
-        pthread_mutex_unlock(&t->tx_lock);
-        atomic_fetch_add_explicit(&t->stat_tx_starts, 1, memory_order_relaxed);
-
         atomic_fetch_add_explicit(&t->stat_batches, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_batch_items, (uint64_t)n, memory_order_relaxed);
 
@@ -1460,6 +1620,23 @@ static void *writer_main(void *arg)
         overlay_state ov;
         memset(&ov, 0, sizeof(ov));
         ov.t = t;
+        ov.cap = (size_t)(WRITER_BATCH_MAX * MAX_HEIGHT * 16);
+        ov.arr = malloc(ov.cap * sizeof(*ov.arr));
+        if (!ov.arr)
+        {
+            perror("malloc overlay arr");
+            exit(EXIT_FAILURE);
+        }
+        ov.idx_cap = ov.cap * 2;
+        ov.idx_table = malloc(ov.idx_cap * sizeof(*ov.idx_table));
+        if (!ov.idx_table)
+        {
+            perror("malloc overlay idx");
+            exit(EXIT_FAILURE);
+        }
+        for (size_t ii = 0; ii < ov.idx_cap; ii++)
+            ov.idx_table[ii] = (size_t)-1;
+        overlay_init_locks(&ov);
 
         for (int i = 0; i < n; i++)
         {
@@ -1479,9 +1656,49 @@ static void *writer_main(void *arg)
         node_id_t root_id = root;
         if (do_sample)
             stage_t0 = monotonic_ns();
-        for (int i = 0; i < n; i++)
+
+        transaction_t *tx = NULL;
+        tx_start_or_join(t, &tx);
+
+        int workers = n;
+        if (workers > TX_APPLY_WORKERS_MAX)
+            workers = TX_APPLY_WORKERS_MAX;
+        if (workers < 1)
+            workers = 1;
+
+        pthread_t wtid[TX_APPLY_WORKERS_MAX];
+        tx_apply_worker_arg warg[TX_APPLY_WORKERS_MAX];
+        int chunk = (n + workers - 1) / workers;
+
+        for (int wi = 0; wi < workers; wi++)
         {
-            apply_insert_overlay(&ov, &root_id, sorted[i].req->key, sorted[i].req->value);
+            int begin = wi * chunk;
+            int end = begin + chunk;
+            if (end > n)
+                end = n;
+
+            warg[wi].t = t;
+            warg[wi].ov = &ov;
+            warg[wi].root_id = &root_id;
+            warg[wi].sorted = sorted;
+            warg[wi].begin = begin;
+            warg[wi].end = end;
+
+            if (pthread_create(&wtid[wi], NULL, tx_apply_worker_main, &warg[wi]) != 0)
+            {
+                perror("pthread_create tx_apply_worker_main");
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        for (int wi = 0; wi < workers; wi++)
+        {
+            pthread_join(wtid[wi], NULL);
+        }
+
+        if (!tx_try_become_winner(t, tx))
+        {
+            tx_wait_commit(tx);
         }
         if (do_sample)
         {
@@ -1500,13 +1717,15 @@ static void *writer_main(void *arg)
         }
         atomic_fetch_add_explicit(&t->stat_overlay_nodes_sum, (uint64_t)ov.len, memory_order_relaxed);
         stat_update_max_u64(&t->stat_overlay_nodes_max, (uint64_t)ov.len);
+        tx_commit_doing(tx);
+        publish_root_tx_winner(t, new_root);
+        tx_commit_completed(t, tx);
+        tx_leave_participant(tx);
+        tx_free(tx);
+
+        overlay_destroy_locks(&ov);
         free(ov.arr);
         free(ov.idx_table);
-
-        /* Btrfs-style transaction handling for cow_btrfs3 */
-        tx_commit_doing(t->current_tx);
-        publish_root_tx_winner(t, new_root);
-        tx_commit_completed(t, t->current_tx);
 
         if (do_sample)
         {
