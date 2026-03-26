@@ -107,10 +107,10 @@ typedef struct
 {
     uint64_t tx_id;
     tx_state_t state;
-    uint64_t num_writers;      // Number of threads joined
+    uint64_t num_writers; // Number of threads joined
     pthread_mutex_t state_lock;
-    pthread_cond_t commit_cv;  // Waiters for commit winner
-    pthread_cond_t observer_cv;// Waiters for commit completion
+    pthread_cond_t commit_cv;   // Waiters for commit winner
+    pthread_cond_t observer_cv; // Waiters for commit completion
 } transaction_t;
 
 typedef struct
@@ -139,17 +139,29 @@ typedef struct
 
     /* Transaction state machine (Btrfs-style) */
     _Atomic(uint64_t) current_tx_id;
-    transaction_t *current_tx;    // Current running/commit transaction
-    pthread_mutex_t tx_lock;       // Protects transaction state changes
-    pthread_cond_t tx_state_cv;    // Signals state transitions
+    transaction_t *current_tx;  // Current running/commit transaction
+    pthread_mutex_t tx_lock;    // Protects transaction state changes
+    pthread_cond_t tx_state_cv; // Signals state transitions
 
-    /* Sequencer thread for append operations */
+    /* Legacy writer/queue path (disabled for direct tx mode) */
     pthread_t writer_tid;
     pthread_mutex_t q_lock;
     pthread_cond_t q_cv;
     insert_req *q_head;
     insert_req *q_tail;
     _Atomic(bool) stop_writer;
+
+    /* Direct tx session shared by main workers */
+    pthread_mutex_t direct_tx_lock;
+    pthread_cond_t direct_tx_cv;
+    uint64_t direct_tx_epoch;
+    uint64_t direct_tx_committed_epoch;
+    uint64_t direct_tx_participants;
+    bool direct_tx_active;
+    bool direct_tx_committing;
+    uint64_t direct_tx_root_id;
+    void *direct_tx_overlay;
+    int expected_workers;
 
     _Atomic(uint64_t) stat_tl_cache_hit;
     _Atomic(uint64_t) stat_ram_cache_hit;
@@ -202,3 +214,5 @@ void cow_close(cow_tree *t);
 
 record *cow_find(cow_tree *t, int64_t key);
 void cow_insert(cow_tree *t, int64_t key, const char *value);
+void cow_insert_direct(cow_tree *t, int64_t key, const char *value);
+void cow_set_expected_workers(cow_tree *t, int workers);

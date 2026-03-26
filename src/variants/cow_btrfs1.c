@@ -51,7 +51,7 @@ typedef struct
     size_t *idx_table;
     size_t idx_cap;
     size_t idx_used;
-    pthread_mutex_t map_lock;
+    pthread_rwlock_t map_rwlock;
     pthread_mutex_t root_lock;
     pthread_mutex_t node_locks[NODE_LOCK_STRIPES];
 } overlay_state;
@@ -319,7 +319,7 @@ static void *get_tls_direct_read_buf(void)
     return buf;
 }
 
-static insert_req *get_tls_insert_req(void)
+static __attribute__((unused)) insert_req *get_tls_insert_req(void)
 {
     if (pthread_once(&req_tls_key_once, init_req_tls_key) != 0)
     {
@@ -411,7 +411,6 @@ static uint32_t reserve_writable_zone(cow_tree *t)
 
         if (cur >= t->info.nr_zones)
         {
-            fprintf(stderr, "zones exhausted\n");
             exit(EXIT_FAILURE);
         }
 
@@ -590,7 +589,6 @@ static pagenum_t cow_append_page(cow_tree *t, page *p)
         if (++retry > t->info.nr_zones)
         {
             perror("nvme_zns_append");
-            fprintf(stderr, "append retry exceeded number of zones\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -838,7 +836,6 @@ static void tx_start_or_join(cow_tree *t, transaction_t **out_tx)
         if (!tx)
         {
             pthread_mutex_unlock(&t->tx_lock);
-            fprintf(stderr, "tx_alloc failed\n");
             exit(EXIT_FAILURE);
         }
         t->current_tx = tx;
@@ -942,9 +939,9 @@ static inline pthread_mutex_t *overlay_node_lock(overlay_state *ov, node_id_t id
 
 static void overlay_init_locks(overlay_state *ov)
 {
-    if (pthread_mutex_init(&ov->map_lock, NULL) != 0)
+    if (pthread_rwlock_init(&ov->map_rwlock, NULL) != 0)
     {
-        perror("pthread_mutex_init ov.map_lock");
+        perror("pthread_rwlock_init ov.map_rwlock");
         exit(EXIT_FAILURE);
     }
     if (pthread_mutex_init(&ov->root_lock, NULL) != 0)
@@ -965,7 +962,7 @@ static void overlay_init_locks(overlay_state *ov)
 static void overlay_destroy_locks(overlay_state *ov)
 {
     pthread_mutex_destroy(&ov->root_lock);
-    pthread_mutex_destroy(&ov->map_lock);
+    pthread_rwlock_destroy(&ov->map_rwlock);
     for (size_t i = 0; i < NODE_LOCK_STRIPES; i++)
     {
         pthread_mutex_destroy(&ov->node_locks[i]);
@@ -1049,7 +1046,6 @@ static overlay_node *overlay_add_node(overlay_state *ov, node_id_t id, const pag
 {
     if (ov->len == ov->cap)
     {
-        fprintf(stderr, "overlay capacity exceeded (%zu)\n", ov->cap);
         exit(EXIT_FAILURE);
     }
 
@@ -1070,36 +1066,49 @@ static overlay_node *overlay_add_node(overlay_state *ov, node_id_t id, const pag
 
 static overlay_node *overlay_get_mut(overlay_state *ov, node_id_t id)
 {
-    pthread_mutex_lock(&ov->map_lock);
+    pthread_rwlock_rdlock(&ov->map_rwlock);
     int idx = overlay_find_idx(ov, id);
     if (idx >= 0)
     {
         overlay_node *ret = &ov->arr[idx];
-        pthread_mutex_unlock(&ov->map_lock);
+        pthread_rwlock_unlock(&ov->map_rwlock);
         return ret;
     }
 
     if (is_temp_id(id))
     {
-        pthread_mutex_unlock(&ov->map_lock);
+        pthread_rwlock_unlock(&ov->map_rwlock);
         return NULL;
     }
 
+    pthread_rwlock_unlock(&ov->map_rwlock);
+
     page p;
     load_page(ov->t, (pagenum_t)id, &p);
-    overlay_node *ret = overlay_add_node(ov, id, &p);
-    pthread_mutex_unlock(&ov->map_lock);
+
+    pthread_rwlock_wrlock(&ov->map_rwlock);
+    idx = overlay_find_idx(ov, id);
+    overlay_node *ret;
+    if (idx >= 0)
+    {
+        ret = &ov->arr[idx];
+    }
+    else
+    {
+        ret = overlay_add_node(ov, id, &p);
+    }
+    pthread_rwlock_unlock(&ov->map_rwlock);
     return ret;
 }
 
 static node_id_t overlay_new_temp(overlay_state *ov, uint32_t is_leaf)
 {
-    pthread_mutex_lock(&ov->map_lock);
+    pthread_rwlock_wrlock(&ov->map_rwlock);
     node_id_t id = make_temp_id(++ov->next_temp);
     overlay_node *n = overlay_add_node(ov, id, NULL);
     n->node.is_leaf = is_leaf;
     n->dirty = 1;
-    pthread_mutex_unlock(&ov->map_lock);
+    pthread_rwlock_unlock(&ov->map_rwlock);
     return id;
 }
 
@@ -1126,19 +1135,22 @@ static uint32_t get_position(page *p, int64_t key)
 
 static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t key, const char *value)
 {
+
     pthread_mutex_lock(&ov->root_lock);
+
     if (*root_id == INVALID_PGN)
     {
+
         node_id_t rid = overlay_new_temp(ov, 1);
-        pthread_mutex_lock(overlay_node_lock(ov, rid));
+
         overlay_node *r = overlay_get_mut(ov, rid);
+
         r->node.num_keys = 1;
         r->node.pointer = INVALID_PGN;
         r->node.leaf[0].key = (uint64_t)key;
         memcpy(r->node.leaf[0].record.value, value, 120);
         r->dirty = 1;
         *root_id = rid;
-        pthread_mutex_unlock(overlay_node_lock(ov, rid));
         pthread_mutex_unlock(&ov->root_lock);
         return;
     }
@@ -1150,17 +1162,23 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
 
     node_id_t cur = cur_root;
     pthread_mutex_t *held_lock = NULL;
+
     while (1)
     {
         pthread_mutex_t *cur_lock = overlay_node_lock(ov, cur);
-        pthread_mutex_lock(cur_lock);
-        held_lock = cur_lock;
+        if (held_lock != cur_lock)
+        {
+            if (held_lock)
+                pthread_mutex_unlock(held_lock);
+            pthread_mutex_lock(cur_lock);
+            held_lock = cur_lock;
+        }
 
         overlay_node *n = overlay_get_mut(ov, cur);
+
         if (!n)
         {
             pthread_mutex_unlock(cur_lock);
-            fprintf(stderr, "overlay: missing node %lu\n", (unsigned long)cur);
             exit(EXIT_FAILURE);
         }
 
@@ -1171,7 +1189,6 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
 
         if (path.depth >= MAX_HEIGHT)
         {
-            fprintf(stderr, "tree depth exceeded MAX_HEIGHT\n");
             exit(EXIT_FAILURE);
         }
 
@@ -1190,10 +1207,6 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         path.depth++;
 
         node_id_t next = (idx == RIGHTMOST_IDX) ? n->node.pointer : n->node.internal[idx].child;
-        pthread_mutex_t *next_lock = overlay_node_lock(ov, next);
-        pthread_mutex_lock(next_lock);
-        pthread_mutex_unlock(cur_lock);
-        held_lock = next_lock;
         cur = next;
     }
 
@@ -1251,7 +1264,6 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         leaf->num_keys = sp;
 
         node_id_t right_id = overlay_new_temp(ov, 1);
-        pthread_mutex_lock(overlay_node_lock(ov, right_id));
         overlay_node *right_n = overlay_get_mut(ov, right_id);
         right_n->node.num_keys = LEAF_ORDER - sp;
         for (uint32_t i = 0; i < LEAF_ORDER - sp; i++)
@@ -1267,7 +1279,6 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         carry_split = 1;
         carry_right = right_id;
         carry_key = (int64_t)right_n->node.leaf[0].key;
-        pthread_mutex_unlock(overlay_node_lock(ov, right_id));
     }
 
     if (held_lock)
@@ -1352,7 +1363,6 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         par_n->dirty = 1;
 
         node_id_t right_id = overlay_new_temp(ov, 0);
-        pthread_mutex_lock(overlay_node_lock(ov, right_id));
         overlay_node *right_n = overlay_get_mut(ov, right_id);
         for (uint32_t j = sp; j < INTERNAL_ORDER; j++)
         {
@@ -1367,14 +1377,12 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         carry_left = pe.id;
         carry_right = right_id;
         carry_key = up_key;
-        pthread_mutex_unlock(overlay_node_lock(ov, right_id));
         pthread_mutex_unlock(par_lock);
     }
 
     if (carry_split)
     {
         node_id_t new_root_id = overlay_new_temp(ov, 0);
-        pthread_mutex_lock(overlay_node_lock(ov, new_root_id));
         overlay_node *r = overlay_get_mut(ov, new_root_id);
         r->node.num_keys = 1;
         r->node.internal[0].key = (uint64_t)carry_key;
@@ -1384,7 +1392,6 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
         pthread_mutex_lock(&ov->root_lock);
         *root_id = new_root_id;
         pthread_mutex_unlock(&ov->root_lock);
-        pthread_mutex_unlock(overlay_node_lock(ov, new_root_id));
     }
 }
 
@@ -1403,7 +1410,6 @@ static pagenum_t flush_overlay_node(overlay_state *ov, node_id_t id)
     int idx = overlay_find_idx(ov, id);
     if (idx < 0)
     {
-        fprintf(stderr, "overlay flush: node not found %lu\n", (unsigned long)id);
         exit(EXIT_FAILURE);
     }
 
@@ -1443,6 +1449,52 @@ static pagenum_t flush_overlay_node(overlay_state *ov, node_id_t id)
 
     n->flushed = 1;
     return n->flushed_pn;
+}
+
+static overlay_state *overlay_create_for_tx(cow_tree *t)
+{
+    overlay_state *ov = calloc(1, sizeof(*ov));
+    if (!ov)
+    {
+        perror("calloc overlay");
+        exit(EXIT_FAILURE);
+    }
+
+    ov->t = t;
+    ov->cap = (size_t)(WRITER_BATCH_MAX * MAX_HEIGHT * 16);
+    ov->arr = malloc(ov->cap * sizeof(*ov->arr));
+    if (!ov->arr)
+    {
+        perror("malloc overlay arr");
+        free(ov);
+        exit(EXIT_FAILURE);
+    }
+
+    ov->idx_cap = ov->cap * 2;
+    ov->idx_table = malloc(ov->idx_cap * sizeof(*ov->idx_table));
+    if (!ov->idx_table)
+    {
+        perror("malloc overlay idx");
+        free(ov->arr);
+        free(ov);
+        exit(EXIT_FAILURE);
+    }
+
+    for (size_t ii = 0; ii < ov->idx_cap; ii++)
+        ov->idx_table[ii] = (size_t)-1;
+
+    overlay_init_locks(ov);
+    return ov;
+}
+
+static void overlay_destroy_for_tx(overlay_state *ov)
+{
+    if (!ov)
+        return;
+    overlay_destroy_locks(ov);
+    free(ov->arr);
+    free(ov->idx_table);
+    free(ov);
 }
 
 static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
@@ -1576,7 +1628,7 @@ static int cmp_batch_item(const void *a, const void *b)
     return 0;
 }
 
-static void *writer_main(void *arg)
+static __attribute__((unused)) void *writer_main(void *arg)
 {
     cow_tree *t = (cow_tree *)arg;
     insert_req *batch[WRITER_BATCH_MAX];
@@ -1865,11 +1917,27 @@ cow_tree *cow_open(const char *path)
 
     atomic_store_explicit(&t->dirty, false, memory_order_release);
     atomic_store_explicit(&t->flusher_stop, false, memory_order_release);
-    atomic_store_explicit(&t->stop_writer, false, memory_order_release);
+    atomic_store_explicit(&t->stop_writer, true, memory_order_release);
 
-    if (pthread_create(&t->flusher_tid, NULL, sb_flusher_thread, t) != 0)
+    if (pthread_mutex_init(&t->direct_tx_lock, NULL) != 0)
     {
-        perror("pthread_create flusher");
+        perror("pthread_mutex_init direct_tx_lock");
+        free(t->zones);
+        free(t->zone_wp_bytes);
+        free(t->zone_full);
+        if (t->direct_fd >= 0)
+            close(t->direct_fd);
+        zbd_close(t->fd);
+        pthread_cond_destroy(&t->q_cv);
+        pthread_mutex_destroy(&t->q_lock);
+        pthread_mutex_destroy(&t->flush_lock);
+        free(t);
+        return NULL;
+    }
+    if (pthread_cond_init(&t->direct_tx_cv, NULL) != 0)
+    {
+        perror("pthread_cond_init direct_tx_cv");
+        pthread_mutex_destroy(&t->direct_tx_lock);
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
@@ -1883,11 +1951,20 @@ cow_tree *cow_open(const char *path)
         return NULL;
     }
 
-    if (pthread_create(&t->writer_tid, NULL, writer_main, t) != 0)
+    t->direct_tx_epoch = 0;
+    t->direct_tx_committed_epoch = 0;
+    t->direct_tx_participants = 0;
+    t->direct_tx_active = false;
+    t->direct_tx_committing = false;
+    t->direct_tx_root_id = (uint64_t)INVALID_PGN;
+    t->direct_tx_overlay = NULL;
+    t->expected_workers = 1;
+
+    if (pthread_create(&t->flusher_tid, NULL, sb_flusher_thread, t) != 0)
     {
-        perror("pthread_create writer");
-        atomic_store_explicit(&t->flusher_stop, true, memory_order_release);
-        pthread_join(t->flusher_tid, NULL);
+        perror("pthread_create flusher");
+        pthread_cond_destroy(&t->direct_tx_cv);
+        pthread_mutex_destroy(&t->direct_tx_lock);
         free(t->zones);
         free(t->zone_wp_bytes);
         free(t->zone_full);
@@ -1909,11 +1986,32 @@ void cow_close(cow_tree *t)
     if (!t)
         return;
 
-    atomic_store_explicit(&t->stop_writer, true, memory_order_release);
-    pthread_mutex_lock(&t->q_lock);
-    pthread_cond_broadcast(&t->q_cv);
-    pthread_mutex_unlock(&t->q_lock);
-    pthread_join(t->writer_tid, NULL);
+    pthread_mutex_lock(&t->direct_tx_lock);
+    while (t->direct_tx_committing)
+    {
+        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+    }
+
+    if (t->direct_tx_active && t->direct_tx_overlay && t->direct_tx_participants == 0)
+    {
+        overlay_state *ov = (overlay_state *)t->direct_tx_overlay;
+        node_id_t root_id = (node_id_t)t->direct_tx_root_id;
+
+        t->direct_tx_active = false;
+        t->direct_tx_overlay = NULL;
+        t->direct_tx_committing = true;
+        pthread_mutex_unlock(&t->direct_tx_lock);
+
+        pagenum_t new_root = (root_id == INVALID_PGN) ? INVALID_PGN : flush_overlay_node(ov, root_id);
+        publish_root_tx_winner(t, new_root);
+        overlay_destroy_for_tx(ov);
+
+        pthread_mutex_lock(&t->direct_tx_lock);
+        t->direct_tx_committed_epoch = t->direct_tx_epoch;
+        t->direct_tx_committing = false;
+        pthread_cond_broadcast(&t->direct_tx_cv);
+    }
+    pthread_mutex_unlock(&t->direct_tx_lock);
 
     {
         uint64_t tl_hit = atomic_load_explicit(&t->stat_tl_cache_hit, memory_order_relaxed);
@@ -1921,17 +2019,11 @@ void cow_close(cow_tree *t)
         uint64_t disk_reads = atomic_load_explicit(&t->stat_disk_reads, memory_order_relaxed);
         uint64_t appends = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
 
-        uint64_t qwait_ins_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_insert, memory_order_relaxed);
-        uint64_t qwait_ins_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_insert, memory_order_relaxed);
-        uint64_t qwait_w_ns = atomic_load_explicit(&t->stat_q_lock_wait_ns_writer, memory_order_relaxed);
-        uint64_t qwait_w_samples = atomic_load_explicit(&t->stat_q_lock_wait_samples_writer, memory_order_relaxed);
+        uint64_t tx_starts = atomic_load_explicit(&t->stat_tx_starts, memory_order_relaxed);
+        uint64_t tx_joins = atomic_load_explicit(&t->stat_tx_joins, memory_order_relaxed);
+        uint64_t tx_winners = atomic_load_explicit(&t->stat_tx_commit_winners, memory_order_relaxed);
+        uint64_t tx_waiters = atomic_load_explicit(&t->stat_tx_commit_waiters, memory_order_relaxed);
 
-        uint64_t batches = atomic_load_explicit(&t->stat_batches, memory_order_relaxed);
-        uint64_t batch_items = atomic_load_explicit(&t->stat_batch_items, memory_order_relaxed);
-        uint64_t qdepth_samples = atomic_load_explicit(&t->stat_queue_depth_samples, memory_order_relaxed);
-        uint64_t qdepth_sum = atomic_load_explicit(&t->stat_queue_depth_sum, memory_order_relaxed);
-        uint64_t qdepth_max = atomic_load_explicit(&t->stat_queue_depth_max, memory_order_relaxed);
-        uint64_t writer_empty_waits = atomic_load_explicit(&t->stat_writer_empty_waits, memory_order_relaxed);
         uint64_t overlay_nodes_sum = atomic_load_explicit(&t->stat_overlay_nodes_sum, memory_order_relaxed);
         uint64_t overlay_nodes_max = atomic_load_explicit(&t->stat_overlay_nodes_max, memory_order_relaxed);
         uint64_t append_retries = atomic_load_explicit(&t->stat_append_retries, memory_order_relaxed);
@@ -1947,15 +2039,9 @@ void cow_close(cow_tree *t)
         uint64_t flush_lat_ns_sum = atomic_load_explicit(&t->stat_flush_latency_ns_sum, memory_order_relaxed);
         uint64_t flush_lat_ns_samples = atomic_load_explicit(&t->stat_flush_latency_ns_samples, memory_order_relaxed);
 
-        double qwait_ins_avg_us = (qwait_ins_samples > 0)
-                                      ? ((double)qwait_ins_ns / (double)qwait_ins_samples / 1000.0)
-                                      : 0.0;
-        double qwait_w_avg_us = (qwait_w_samples > 0)
-                                    ? ((double)qwait_w_ns / (double)qwait_w_samples / 1000.0)
-                                    : 0.0;
-        double avg_batch_size = (batches > 0) ? ((double)batch_items / (double)batches) : 0.0;
-        double avg_qdepth = (qdepth_samples > 0) ? ((double)qdepth_sum / (double)qdepth_samples) : 0.0;
-        double avg_overlay_nodes = (batches > 0) ? ((double)overlay_nodes_sum / (double)batches) : 0.0;
+        double avg_joins_per_tx = (tx_starts > 0) ? ((double)tx_joins / (double)tx_starts) : 0.0;
+        double waiter_ratio = (tx_joins > 0) ? ((double)tx_waiters / (double)tx_joins) : 0.0;
+        double avg_overlay_nodes = (tx_winners > 0) ? ((double)overlay_nodes_sum / (double)tx_winners) : 0.0;
         double append_lat_avg_us = (append_lat_ns_samples > 0) ? ((double)append_lat_ns_sum / (double)append_lat_ns_samples / 1000.0) : 0.0;
         double batch_lat_avg_us = (batch_lat_ns_samples > 0) ? ((double)batch_lat_ns_sum / (double)batch_lat_ns_samples / 1000.0) : 0.0;
         double sort_lat_avg_us = (sort_lat_ns_samples > 0) ? ((double)sort_lat_ns_sum / (double)sort_lat_ns_samples / 1000.0) : 0.0;
@@ -1964,31 +2050,28 @@ void cow_close(cow_tree *t)
 
         fprintf(stderr,
                 "[btrfs1] page_cache tl_hit=%lu ram_hit=%lu disk_reads=%lu\n"
-                "[btrfs1] q_lock_wait_avg_us insert=%.2f writer=%.2f\n"
-                "[btrfs1] avg_batch_size=%.2f batches=%lu items=%lu\n"
-            "[btrfs1] queue_depth avg=%.2f max=%lu writer_empty_waits=%lu\n"
-            "[btrfs1] overlay_nodes avg=%.2f max=%lu\n"
-            "[btrfs1] append_retries=%lu zone_rotations=%lu\n"
-            "[btrfs1] sampled_latency_us append=%.2f batch=%.2f\n"
+                "[btrfs1] direct_tx starts=%lu joins=%lu winners=%lu waiters=%lu\n"
+                "[btrfs1] direct_tx joins_per_tx=%.2f waiter_ratio=%.2f\n"
+                "[btrfs1] overlay_nodes avg=%.2f max=%lu\n"
+                "[btrfs1] append_retries=%lu zone_rotations=%lu\n"
+                "[btrfs1] sampled_latency_us append=%.2f batch=%.2f\n"
                 "[btrfs1] sampled_stage_us sort=%.2f apply=%.2f flush=%.2f\n"
                 "[btrfs1] page_appends=%lu\n",
                 (unsigned long)tl_hit,
                 (unsigned long)ram_hit,
                 (unsigned long)disk_reads,
-                qwait_ins_avg_us,
-                qwait_w_avg_us,
-                avg_batch_size,
-                (unsigned long)batches,
-                (unsigned long)batch_items,
-            avg_qdepth,
-            (unsigned long)qdepth_max,
-            (unsigned long)writer_empty_waits,
-            avg_overlay_nodes,
-            (unsigned long)overlay_nodes_max,
-            (unsigned long)append_retries,
-            (unsigned long)zone_rotations,
-            append_lat_avg_us,
-            batch_lat_avg_us,
+                (unsigned long)tx_starts,
+                (unsigned long)tx_joins,
+                (unsigned long)tx_winners,
+                (unsigned long)tx_waiters,
+                avg_joins_per_tx,
+                waiter_ratio,
+                avg_overlay_nodes,
+                (unsigned long)overlay_nodes_max,
+                (unsigned long)append_retries,
+                (unsigned long)zone_rotations,
+                append_lat_avg_us,
+                batch_lat_avg_us,
                 sort_lat_avg_us,
                 apply_lat_avg_us,
                 flush_lat_avg_us,
@@ -2023,6 +2106,9 @@ void cow_close(cow_tree *t)
     pthread_cond_destroy(&t->q_cv);
     pthread_mutex_destroy(&t->q_lock);
     pthread_mutex_destroy(&t->flush_lock);
+
+    pthread_cond_destroy(&t->direct_tx_cv);
+    pthread_mutex_destroy(&t->direct_tx_lock);
 
     /* Cleanup transaction state machine */
     if (t->current_tx)
@@ -2075,38 +2161,107 @@ record *cow_find(cow_tree *t, int64_t key)
     return NULL;
 }
 
+void cow_set_expected_workers(cow_tree *t, int workers)
+{
+    if (!t)
+        return;
+    if (workers < 1)
+        workers = 1;
+    t->expected_workers = workers;
+}
+
+void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
+{
+    uint64_t my_epoch;
+    overlay_state *ov;
+
+    pthread_mutex_lock(&t->direct_tx_lock);
+
+    while (t->direct_tx_committing)
+    {
+        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+    }
+
+    if (!t->direct_tx_active)
+    {
+        pagenum_t root;
+        uint64_t seq;
+
+        read_tree_snapshot(t, &root, &seq);
+        (void)seq;
+
+        ov = overlay_create_for_tx(t);
+
+        t->direct_tx_overlay = ov;
+        t->direct_tx_root_id = (uint64_t)root;
+        t->direct_tx_active = true;
+        t->direct_tx_epoch++;
+
+        atomic_fetch_add_explicit(&t->stat_tx_starts, 1, memory_order_relaxed);
+    }
+
+    my_epoch = t->direct_tx_epoch;
+    t->direct_tx_participants++;
+
+    atomic_fetch_add_explicit(&t->stat_tx_joins, 1, memory_order_relaxed);
+
+    ov = (overlay_state *)t->direct_tx_overlay;
+    pthread_mutex_unlock(&t->direct_tx_lock);
+
+    apply_insert_overlay(ov, (node_id_t *)&t->direct_tx_root_id, key, value);
+
+    pthread_mutex_lock(&t->direct_tx_lock);
+
+    t->direct_tx_participants--;
+
+    if (t->direct_tx_active &&
+        t->direct_tx_epoch == my_epoch &&
+        t->direct_tx_participants == 0)
+    {
+
+        overlay_state *commit_ov = (overlay_state *)t->direct_tx_overlay;
+        node_id_t commit_root = (node_id_t)t->direct_tx_root_id;
+
+        t->direct_tx_overlay = NULL;
+        t->direct_tx_active = false;
+        t->direct_tx_committing = true;
+        atomic_fetch_add_explicit(&t->stat_tx_commit_winners, 1, memory_order_relaxed);
+
+        pthread_mutex_unlock(&t->direct_tx_lock);
+
+        pagenum_t new_root = (commit_root == INVALID_PGN)
+                                 ? INVALID_PGN
+                                 : flush_overlay_node(commit_ov, commit_root);
+
+        atomic_fetch_add_explicit(&t->stat_overlay_nodes_sum, (uint64_t)commit_ov->len, memory_order_relaxed);
+        stat_update_max_u64(&t->stat_overlay_nodes_max, (uint64_t)commit_ov->len);
+
+        publish_root_tx_winner(t, new_root);
+
+        overlay_destroy_for_tx(commit_ov);
+
+        pthread_mutex_lock(&t->direct_tx_lock);
+        t->direct_tx_committed_epoch = my_epoch;
+        t->direct_tx_committing = false;
+
+        pthread_cond_broadcast(&t->direct_tx_cv);
+        pthread_mutex_unlock(&t->direct_tx_lock);
+
+        return;
+    }
+
+    atomic_fetch_add_explicit(&t->stat_tx_commit_waiters, 1, memory_order_relaxed);
+
+    while (t->direct_tx_committed_epoch < my_epoch)
+    {
+
+        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+    }
+
+    pthread_mutex_unlock(&t->direct_tx_lock);
+}
+
 void cow_insert(cow_tree *t, int64_t key, const char *value)
 {
-    insert_req *req = get_tls_insert_req();
-    req->key = key;
-    memcpy(req->value, value, 120);
-    req->done = 0;
-    req->next = NULL;
-
-    uint64_t qwait_start = monotonic_ns();
-    pthread_mutex_lock(&t->q_lock);
-    uint64_t qwait_end = monotonic_ns();
-    atomic_fetch_add_explicit(&t->stat_q_lock_wait_ns_insert, qwait_end - qwait_start, memory_order_relaxed);
-    atomic_fetch_add_explicit(&t->stat_q_lock_wait_samples_insert, 1, memory_order_relaxed);
-    if (t->q_tail)
-        t->q_tail->next = req;
-    else
-        t->q_head = req;
-    t->q_tail = req;
-    uint64_t qd = atomic_fetch_add_explicit(&t->stat_queue_depth_current, 1, memory_order_relaxed) + 1;
-    if (prof_should_sample())
-    {
-        atomic_fetch_add_explicit(&t->stat_queue_depth_sum, qd, memory_order_relaxed);
-        atomic_fetch_add_explicit(&t->stat_queue_depth_samples, 1, memory_order_relaxed);
-        stat_update_max_u64(&t->stat_queue_depth_max, qd);
-    }
-    pthread_cond_signal(&t->q_cv);
-    pthread_mutex_unlock(&t->q_lock);
-
-    pthread_mutex_lock(&req->done_lock);
-    while (!req->done)
-    {
-        pthread_cond_wait(&req->done_cv, &req->done_lock);
-    }
-    pthread_mutex_unlock(&req->done_lock);
+    cow_insert_direct(t, key, value);
 }

@@ -19,7 +19,8 @@
 
 #define PROGRESS_STEP 1000
 
-typedef struct {
+typedef struct
+{
     cow_tree *t;
     int *keys;
     int start;
@@ -29,20 +30,25 @@ typedef struct {
 atomic_int global_done = 0;
 
 int *all_keys = NULL;
-int total_keys = 0;   // ← 추가
+int total_keys = 0; // ← 추가
 
 void *worker(void *arg)
 {
     thread_arg *a = (thread_arg *)arg;
 
-    for (int i = a->start; i < a->end; i++) {
+    for (int i = a->start; i < a->end; i++)
+    {
 
         int key = a->keys[i];
 
         char buf[120];
         sprintf(buf, "value-%d", key);
 
+#if defined(COW_BTRFS1)
+        cow_insert_direct(a->t, key, buf);
+#else
         cow_insert(a->t, key, buf);
+#endif
     }
 
     return NULL;
@@ -55,10 +61,15 @@ void run_test(const char *dev_path, int num_threads)
     atomic_store(&global_done, 0);
 
     cow_tree *t = cow_open(dev_path);
-    if (!t) {
+    if (!t)
+    {
         perror("cow_open failed");
         exit(1);
     }
+
+#if defined(COW_BTRFS1)
+    cow_set_expected_workers(t, num_threads);
+#endif
 
     pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
     thread_arg *args = malloc(sizeof(thread_arg) * num_threads);
@@ -68,18 +79,20 @@ void run_test(const char *dev_path, int num_threads)
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < num_threads; i++)
+    {
         args[i].t = t;
         args[i].keys = all_keys;
         args[i].start = i * chunk;
         args[i].end = (i == num_threads - 1)
-                      ? total_keys
-                      : (i + 1) * chunk;
+                          ? total_keys
+                          : (i + 1) * chunk;
 
         pthread_create(&threads[i], NULL, worker, &args[i]);
     }
 
-    for (int i = 0; i < num_threads; i++) {
+    for (int i = 0; i < num_threads; i++)
+    {
         pthread_join(threads[i], NULL);
     }
 
@@ -114,18 +127,20 @@ void run_test(const char *dev_path, int num_threads)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 4) {
+    if (argc != 4)
+    {
         printf("Usage: %s <key_num> <mode> <device>\n", argv[0]);
         printf("mode: 0=all  1=1thread  2=2thread  4=4thread  8  16 32\n");
         return 1;
     }
 
-    total_keys = atoi(argv[1]);   // ← key 개수
+    total_keys = atoi(argv[1]); // ← key 개수
     int mode = atoi(argv[2]);
     const char *dev_path = argv[3];
 
     all_keys = malloc(sizeof(int) * total_keys);
-    if (!all_keys) {
+    if (!all_keys)
+    {
         perror("malloc keys failed");
         return 1;
     }
@@ -135,7 +150,8 @@ int main(int argc, char *argv[])
 
     srand(54321);
 
-    for (int i = total_keys - 1; i > 0; i--) {
+    for (int i = total_keys - 1; i > 0; i--)
+    {
         int j = rand() % (i + 1);
         int tmp = all_keys[i];
         all_keys[i] = all_keys[j];
@@ -155,22 +171,29 @@ int main(int argc, char *argv[])
     int thread_counts[] = {1, 2, 4, 8, 16, 32, 64};
     int num_configs = sizeof(thread_counts) / sizeof(thread_counts[0]);
 
-    if (mode == 0) {
-        for (int i = 0; i < num_configs; i++) {
+    if (mode == 0)
+    {
+        for (int i = 0; i < num_configs; i++)
+        {
             run_test(dev_path, thread_counts[i]);
         }
-    } else {
+    }
+    else
+    {
         int valid = 0;
 
-        for (int i = 0; i < num_configs; i++) {
-            if (mode == thread_counts[i]) {
+        for (int i = 0; i < num_configs; i++)
+        {
+            if (mode == thread_counts[i])
+            {
                 run_test(dev_path, mode);
                 valid = 1;
                 break;
             }
         }
 
-        if (!valid) {
+        if (!valid)
+        {
             printf("Invalid mode: %d\n", mode);
             printf("Allowed values: 0, 1, 2, 4, 8, 16\n");
             free(all_keys);
