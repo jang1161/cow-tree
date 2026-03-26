@@ -3,6 +3,7 @@ build/
 tmp*
 *tuning*
 logs*
+refs/ref4_btrfs/btrfs
 
 # Local benchmark binaries (legacy names)
 cow_test_bt

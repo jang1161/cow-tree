@@ -103,7 +103,11 @@ void run_test(const char *dev_path, int num_threads)
     printf("Resetting ZNS device...\n");
     char cmd[256];
     sprintf(cmd, "sudo nvme zns reset-zone -a %s", dev_path);
-    system(cmd);
+    int rc = system(cmd);
+    if (rc == -1)
+    {
+        perror("system");
+    }
 
     sleep(1);
 }
