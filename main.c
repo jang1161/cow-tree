@@ -13,6 +13,8 @@
 #include "variants/cow_btrfs2.h"
 #elif defined(COW_BTRFS3)
 #include "variants/cow_btrfs3.h"
+#elif defined(COW_FAST)
+#include "variants/cow_fast.h"
 #else
 #include "cow_ram_stage2v2.h"
 #endif
