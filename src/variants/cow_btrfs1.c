@@ -1946,11 +1946,13 @@ cow_tree *cow_open(const char *path)
     t->direct_tx_epoch = 0;
     t->direct_tx_committed_epoch = 0;
     t->direct_tx_participants = 0;
+    t->direct_tx_completed = 0;
     t->direct_tx_active = false;
     t->direct_tx_committing = false;
+    t->direct_tx_closed = false;
     t->direct_tx_root_id = (uint64_t)INVALID_PGN;
     t->direct_tx_overlay = NULL;
-    t->expected_workers = 1;
+    t->expected_workers = 64;  /* Default to max expected; should be overridden by cow_set_expected_workers */
 
     if (pthread_create(&t->flusher_tid, NULL, sb_flusher_thread, t) != 0)
     {
@@ -1984,7 +1986,24 @@ void cow_close(cow_tree *t)
         pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
     }
 
-    if (t->direct_tx_active && t->direct_tx_overlay && t->direct_tx_participants == 0)
+    /* If current TX is closed but not fully completed, wait for completion.
+       This prevents extra workers from joining a full TX. */
+    while (t->direct_tx_active &&
+           t->direct_tx_closed &&
+           t->direct_tx_completed < t->direct_tx_participants)
+    {
+        atomic_fetch_add_explicit(&t->stat_tx_commit_waiters, 1, memory_order_relaxed);
+        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+
+        while (t->direct_tx_committing)
+        {
+            pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+        }
+    }
+
+    if (t->direct_tx_active &&
+        t->direct_tx_overlay &&
+        t->direct_tx_completed == t->direct_tx_participants)
     {
         overlay_state *ov = (overlay_state *)t->direct_tx_overlay;
         node_id_t root_id = (node_id_t)t->direct_tx_root_id;
@@ -2043,26 +2062,45 @@ void cow_close(cow_tree *t)
         double apply_lat_avg_us = (apply_lat_ns_samples > 0) ? ((double)apply_lat_ns_sum / (double)apply_lat_ns_samples / 1000.0) : 0.0;
         double flush_lat_avg_us = (flush_lat_ns_samples > 0) ? ((double)flush_lat_ns_sum / (double)flush_lat_ns_samples / 1000.0) : 0.0;
 
+        /* TX 병렬성 분석: starts(생성된 TX 개수), joins(총 insert 개수, 각 insert마다 1번씩),
+           joins_per_tx(TX당 평균 batch 크기=Total inserts/TX개수),
+           winners(커밋 수행 워커), waiters(대기 워커, Non-blocking이므로 0),
+           waiter_ratio(대기 워커 비율). 참고: concurrent_workers_max와는 다름!
+           (joins_per_tx는 batch 크기, concurrent는 동시 참여 워커 수) */
         fprintf(stderr,
-                "[btrfs1] TX_PARALLELISM: starts=%lu joins=%.0f joins_per_tx=%.2f winners=%lu waiters=%lu waiter_ratio=%.2f\n"
-                "[btrfs1] STAGE_LATENCY_US: append=%.2f batch=%.2f sort=%.2f apply=%.2f flush=%.2f\n"
-                "[btrfs1] OVERLAY_CONTENTION: nodes_avg=%.2f nodes_max=%lu queue_depth_avg=%.2f queue_depth_max=%lu\n"
-                "[btrfs1] TX_BOTTLENECK: concurrent_writers_max=%lu\n",
+                "[btrfs1] TX_PARALLELISM: starts=%lu joins=%.0f joins_per_tx=%.2f winners=%lu waiters=%lu waiter_ratio=%.2f (batch_size)\n",
                 (unsigned long)tx_starts,
                 (double)tx_joins,
                 avg_joins_per_tx,
                 (unsigned long)tx_winners,
                 (unsigned long)tx_waiters,
-                waiter_ratio,
+                waiter_ratio);
+
+        /* 단계별 레이턴시: append(NVMe append 시간), batch(배치 대기), sort(정렬),
+           apply(Overlay 적용, insert들을 B+tree에 적용하는 시간),
+           flush(Overlay 노드 flush, Non-blocking 구조에서는 대부분 0) */
+        fprintf(stderr,
+                "[btrfs1] STAGE_LATENCY_US: append=%.2f batch=%.2f sort=%.2f apply=%.2f flush=%.2f\n",
                 append_lat_avg_us,
                 batch_lat_avg_us,
                 sort_lat_avg_us,
                 apply_lat_avg_us,
-                flush_lat_avg_us,
+                flush_lat_avg_us);
+
+        /* Overlay 경합 분석: nodes_avg(TX당 수정된 Overlay 노드 평균=batch크기와 비례),
+           nodes_max(최대), queue_depth_avg(배치 큐 평균 깊이, Non-blocking에선 0),
+           queue_depth_max(최대) */
+        fprintf(stderr,
+                "[btrfs1] OVERLAY_CONTENTION: nodes_avg=%.2f nodes_max=%lu queue_depth_avg=%.2f queue_depth_max=%lu\n",
                 avg_overlay_nodes,
                 (unsigned long)overlay_nodes_max,
                 avg_queue_depth,
-                (unsigned long)queue_depth_max,
+                (unsigned long)queue_depth_max);
+
+        /* TX 병목 분석: concurrent_writers_max(한 TX에 동시 참여한 최대 워커 수=총_스레드_수 이상일 수 없음).
+           참고: joins_per_tx >> concurrent_writers_max인 것이 정상! 많은 inserts가 배치로 묶이기 때문 */
+        fprintf(stderr,
+                "[btrfs1] TX_BOTTLENECK: concurrent_writers_max=%lu (한 TX 동시 워커)\n",
                 (unsigned long)concurrent_writers_max);
     }
 
@@ -2165,31 +2203,54 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
 
     pthread_mutex_lock(&t->direct_tx_lock);
 
-    while (t->direct_tx_committing)
+    for (;;)
     {
-        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+        while (t->direct_tx_committing)
+        {
+            pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+        }
+
+        if (!t->direct_tx_active)
+        {
+            pagenum_t root;
+            uint64_t seq;
+
+            read_tree_snapshot(t, &root, &seq);
+            (void)seq;
+
+            ov = overlay_create_for_tx(t);
+
+            t->direct_tx_overlay = ov;
+            t->direct_tx_root_id = (uint64_t)root;
+            t->direct_tx_active = true;
+            t->direct_tx_closed = false;
+            t->direct_tx_participants = 0;
+            t->direct_tx_completed = 0;
+            t->direct_tx_epoch++;
+
+            atomic_fetch_add_explicit(&t->stat_tx_starts, 1, memory_order_relaxed);
+        }
+
+        /* Hard cap: once TX is closed/full, newcomers must wait. */
+        if (t->direct_tx_closed ||
+            t->direct_tx_participants >= (uint64_t)t->expected_workers)
+        {
+            t->direct_tx_closed = true;
+            atomic_fetch_add_explicit(&t->stat_tx_commit_waiters, 1, memory_order_relaxed);
+            pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
+            continue;
+        }
+
+        my_epoch = t->direct_tx_epoch;
+        t->direct_tx_participants++;
+
+        if (t->direct_tx_participants >= (uint64_t)t->expected_workers)
+        {
+            t->direct_tx_closed = true;
+        }
+
+        break;
     }
-
-    if (!t->direct_tx_active)
-    {
-        pagenum_t root;
-        uint64_t seq;
-
-        read_tree_snapshot(t, &root, &seq);
-        (void)seq;
-
-        ov = overlay_create_for_tx(t);
-
-        t->direct_tx_overlay = ov;
-        t->direct_tx_root_id = (uint64_t)root;
-        t->direct_tx_active = true;
-        t->direct_tx_epoch++;
-
-        atomic_fetch_add_explicit(&t->stat_tx_starts, 1, memory_order_relaxed);
-    }
-
-    my_epoch = t->direct_tx_epoch;
-    t->direct_tx_participants++;
 
     /* Track max concurrent writers */
     if (t->direct_tx_participants > atomic_load_explicit(&t->stat_concurrent_writers_max, memory_order_relaxed))
@@ -2202,22 +2263,32 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
     ov = (overlay_state *)t->direct_tx_overlay;
     pthread_mutex_unlock(&t->direct_tx_lock);
 
+    /* Apply phase (can run in parallel with other workers) */
     apply_insert_overlay(ov, (node_id_t *)&t->direct_tx_root_id, key, value);
 
+    /* Non-blocking commit: Increment completion counter after apply */
     pthread_mutex_lock(&t->direct_tx_lock);
+    t->direct_tx_completed++;
 
-    t->direct_tx_participants--;
+    /* Wake waiters when completion progresses. */
+    pthread_cond_broadcast(&t->direct_tx_cv);
 
+    /* Trigger commit when all expected workers have completed their apply phase */
     if (t->direct_tx_active &&
         t->direct_tx_epoch == my_epoch &&
-        t->direct_tx_participants == 0)
+        t->direct_tx_participants == t->expected_workers &&
+        t->direct_tx_completed == t->direct_tx_participants &&
+        !t->direct_tx_committing)
     {
-
+        /* Last worker performs commit (other workers have already returned) */
         overlay_state *commit_ov = (overlay_state *)t->direct_tx_overlay;
         node_id_t commit_root = (node_id_t)t->direct_tx_root_id;
+        uint64_t committed_epoch = t->direct_tx_epoch;
 
+        /* Atomically transition to next epoch to prevent new wave from entering */
         t->direct_tx_overlay = NULL;
         t->direct_tx_active = false;
+        t->direct_tx_epoch++;  /* Increment epoch BEFORE commit so new workers wait */
         t->direct_tx_committing = true;
         atomic_fetch_add_explicit(&t->stat_tx_commit_winners, 1, memory_order_relaxed);
 
@@ -2235,23 +2306,12 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
         overlay_destroy_for_tx(commit_ov);
 
         pthread_mutex_lock(&t->direct_tx_lock);
-        t->direct_tx_committed_epoch = my_epoch;
+        t->direct_tx_committed_epoch = committed_epoch;
         t->direct_tx_committing = false;
-
         pthread_cond_broadcast(&t->direct_tx_cv);
-        pthread_mutex_unlock(&t->direct_tx_lock);
-
-        return;
     }
 
-    atomic_fetch_add_explicit(&t->stat_tx_commit_waiters, 1, memory_order_relaxed);
-
-    while (t->direct_tx_committed_epoch < my_epoch)
-    {
-
-        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
-    }
-
+    /* Non-blocking return: All workers exit here, regardless of commit status */
     pthread_mutex_unlock(&t->direct_tx_lock);
 }
 

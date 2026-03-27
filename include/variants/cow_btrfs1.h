@@ -156,9 +156,11 @@ typedef struct
     pthread_cond_t direct_tx_cv;
     uint64_t direct_tx_epoch;
     uint64_t direct_tx_committed_epoch;
-    uint64_t direct_tx_participants;
+    uint64_t direct_tx_participants;      /* 이 TX에 참여한 총 worker 수 (감소 안 함) */
+    uint64_t direct_tx_completed;         /* 작업 완료한 worker 수 (close 및 commit 판단용) */
     bool direct_tx_active;
     bool direct_tx_committing;
+    bool direct_tx_closed;    /* TX가 만석(participants == expected_workers)이므로 새 참여자를 받지 않음 */
     uint64_t direct_tx_root_id;
     void *direct_tx_overlay;
     int expected_workers;

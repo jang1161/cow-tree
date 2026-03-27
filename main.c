@@ -8,11 +8,11 @@
 #include <unistd.h>
 
 #if defined(COW_BTRFS1)
-#include "cow_btrfs1.h"
+#include "variants/cow_btrfs1.h"
 #elif defined(COW_BTRFS2)
-#include "cow_btrfs2.h"
+#include "variants/cow_btrfs2.h"
 #elif defined(COW_BTRFS3)
-#include "cow_btrfs3.h"
+#include "variants/cow_btrfs3.h"
 #else
 #include "cow_ram_stage2v2.h"
 #endif
@@ -67,9 +67,8 @@ void run_test(const char *dev_path, int num_threads)
         exit(1);
     }
 
-#if defined(COW_BTRFS1)
+    /* Always set expected_workers for direct TX mode */
     cow_set_expected_workers(t, num_threads);
-#endif
 
     pthread_t *threads = malloc(sizeof(pthread_t) * num_threads);
     thread_arg *args = malloc(sizeof(thread_arg) * num_threads);
