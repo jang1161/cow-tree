@@ -163,30 +163,16 @@ typedef struct
     void *direct_tx_overlay;
     int expected_workers;
 
-    _Atomic(uint64_t) stat_tl_cache_hit;
-    _Atomic(uint64_t) stat_ram_cache_hit;
-    _Atomic(uint64_t) stat_disk_reads;
-    _Atomic(uint64_t) stat_page_appends;
-
+    /* Throughput & Latency Stats */
+    _Atomic(uint64_t) stat_batches;
+    _Atomic(uint64_t) stat_batch_items;
     _Atomic(uint64_t) stat_q_lock_wait_ns_insert;
     _Atomic(uint64_t) stat_q_lock_wait_samples_insert;
     _Atomic(uint64_t) stat_q_lock_wait_ns_writer;
     _Atomic(uint64_t) stat_q_lock_wait_samples_writer;
-
-    _Atomic(uint64_t) stat_batches;
-    _Atomic(uint64_t) stat_batch_items;
-
-    _Atomic(uint64_t) stat_queue_depth_current;
-    _Atomic(uint64_t) stat_queue_depth_samples;
-    _Atomic(uint64_t) stat_queue_depth_sum;
-    _Atomic(uint64_t) stat_queue_depth_max;
-
     _Atomic(uint64_t) stat_writer_empty_waits;
-    _Atomic(uint64_t) stat_overlay_nodes_sum;
-    _Atomic(uint64_t) stat_overlay_nodes_max;
 
-    _Atomic(uint64_t) stat_append_retries;
-    _Atomic(uint64_t) stat_zone_rotations;
+    /* Stage-specific latency */
     _Atomic(uint64_t) stat_append_latency_ns_samples;
     _Atomic(uint64_t) stat_append_latency_ns_sum;
     _Atomic(uint64_t) stat_batch_latency_ns_samples;
@@ -198,11 +184,38 @@ typedef struct
     _Atomic(uint64_t) stat_flush_latency_ns_samples;
     _Atomic(uint64_t) stat_flush_latency_ns_sum;
 
-    /* Btrfs-style stats */
+    /* Bottleneck Analysis Stats */
+    _Atomic(uint64_t) stat_overlay_nodes_sum;
+    _Atomic(uint64_t) stat_overlay_nodes_max;
+    _Atomic(uint64_t) stat_queue_depth_current;
+    _Atomic(uint64_t) stat_queue_depth_sum;
+    _Atomic(uint64_t) stat_queue_depth_max;
+    _Atomic(uint64_t) stat_queue_depth_samples;
+
+    /* RWLock Contention */
+    _Atomic(uint64_t) stat_rwlock_try_failed;
+    _Atomic(uint64_t) stat_rwlock_try_total;
+
+    /* Fallback Mutex Contention (serial apply mode) */
+    _Atomic(uint64_t) stat_fallback_lock_waits_ns;
+    _Atomic(uint64_t) stat_fallback_lock_waits_count;
+
+    /* Apply Stage Lock Wait (within parallel apply) */
+    _Atomic(uint64_t) stat_apply_lock_waits_ns;
+    _Atomic(uint64_t) stat_apply_lock_waits_count;
+
+    /* Concurrent Writer Activity */
+    _Atomic(uint64_t) stat_concurrent_writers_max;
+
+    /* TX State Machine Stats */
     _Atomic(uint64_t) stat_tx_starts;
     _Atomic(uint64_t) stat_tx_joins;
     _Atomic(uint64_t) stat_tx_commit_winners;
     _Atomic(uint64_t) stat_tx_commit_waiters;
+
+    /* Winner Selection & Waiter Blocking */
+    _Atomic(uint64_t) stat_winner_wait_ns_sum;
+    _Atomic(uint64_t) stat_winner_wait_samples;
 
     void *ram_slots;
     size_t ram_cap;

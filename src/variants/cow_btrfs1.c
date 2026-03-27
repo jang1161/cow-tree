@@ -436,13 +436,11 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
     if (slot->valid && slot->pn == pn)
     {
         *dst = slot->data;
-        atomic_fetch_add_explicit(&t->stat_tl_cache_hit, 1, memory_order_relaxed);
         return;
     }
 
     if (ram_table_lookup(t, pn, dst))
     {
-        atomic_fetch_add_explicit(&t->stat_ram_cache_hit, 1, memory_order_relaxed);
         slot->valid = 1;
         slot->pn = pn;
         slot->data = *dst;
@@ -459,7 +457,6 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
             exit(EXIT_FAILURE);
         }
         memcpy(dst, raw, PAGE_SIZE);
-        atomic_fetch_add_explicit(&t->stat_disk_reads, 1, memory_order_relaxed);
     }
     else
     {
@@ -468,7 +465,6 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
             perror("load_page");
             exit(EXIT_FAILURE);
         }
-        atomic_fetch_add_explicit(&t->stat_disk_reads, 1, memory_order_relaxed);
     }
 
     slot->valid = 1;
@@ -533,7 +529,6 @@ static pagenum_t cow_append_page(cow_tree *t, page *p)
         {
             atomic_fetch_sub_explicit(&t->zone_wp_bytes[zone_id], page_bytes, memory_order_acq_rel);
             atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
-            atomic_fetch_add_explicit(&t->stat_zone_rotations, 1, memory_order_relaxed);
 
             uint32_t expected = zone_id;
             uint32_t next = zone_next(t, zone_id);
@@ -547,7 +542,6 @@ static pagenum_t cow_append_page(cow_tree *t, page *p)
         uint64_t wp_bytes;
         if (zone_append_raw_nolock(t, zone_id, p, &pn, &wp_bytes) == 0)
         {
-            atomic_fetch_add_explicit(&t->stat_page_appends, 1, memory_order_relaxed);
             uint64_t cur_wp = atomic_load_explicit(&t->zone_wp_bytes[zone_id], memory_order_acquire);
             while (wp_bytes > cur_wp &&
                    !atomic_compare_exchange_weak_explicit(
@@ -578,13 +572,11 @@ static pagenum_t cow_append_page(cow_tree *t, page *p)
         }
 
         atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
-        atomic_fetch_add_explicit(&t->stat_zone_rotations, 1, memory_order_relaxed);
         uint32_t expected = zone_id;
         uint32_t next = zone_next(t, zone_id);
         atomic_compare_exchange_weak_explicit(
             &t->current_zone, &expected, next,
             memory_order_acq_rel, memory_order_acquire);
-        atomic_fetch_add_explicit(&t->stat_append_retries, 1, memory_order_relaxed);
 
         if (++retry > t->info.nr_zones)
         {
@@ -2014,20 +2006,13 @@ void cow_close(cow_tree *t)
     pthread_mutex_unlock(&t->direct_tx_lock);
 
     {
-        uint64_t tl_hit = atomic_load_explicit(&t->stat_tl_cache_hit, memory_order_relaxed);
-        uint64_t ram_hit = atomic_load_explicit(&t->stat_ram_cache_hit, memory_order_relaxed);
-        uint64_t disk_reads = atomic_load_explicit(&t->stat_disk_reads, memory_order_relaxed);
-        uint64_t appends = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
-
+        /* TX structure analysis */
         uint64_t tx_starts = atomic_load_explicit(&t->stat_tx_starts, memory_order_relaxed);
         uint64_t tx_joins = atomic_load_explicit(&t->stat_tx_joins, memory_order_relaxed);
         uint64_t tx_winners = atomic_load_explicit(&t->stat_tx_commit_winners, memory_order_relaxed);
         uint64_t tx_waiters = atomic_load_explicit(&t->stat_tx_commit_waiters, memory_order_relaxed);
 
-        uint64_t overlay_nodes_sum = atomic_load_explicit(&t->stat_overlay_nodes_sum, memory_order_relaxed);
-        uint64_t overlay_nodes_max = atomic_load_explicit(&t->stat_overlay_nodes_max, memory_order_relaxed);
-        uint64_t append_retries = atomic_load_explicit(&t->stat_append_retries, memory_order_relaxed);
-        uint64_t zone_rotations = atomic_load_explicit(&t->stat_zone_rotations, memory_order_relaxed);
+        /* Stage latency */
         uint64_t append_lat_ns_sum = atomic_load_explicit(&t->stat_append_latency_ns_sum, memory_order_relaxed);
         uint64_t append_lat_ns_samples = atomic_load_explicit(&t->stat_append_latency_ns_samples, memory_order_relaxed);
         uint64_t batch_lat_ns_sum = atomic_load_explicit(&t->stat_batch_latency_ns_sum, memory_order_relaxed);
@@ -2039,9 +2024,19 @@ void cow_close(cow_tree *t)
         uint64_t flush_lat_ns_sum = atomic_load_explicit(&t->stat_flush_latency_ns_sum, memory_order_relaxed);
         uint64_t flush_lat_ns_samples = atomic_load_explicit(&t->stat_flush_latency_ns_samples, memory_order_relaxed);
 
+        /* Bottleneck metrics */
+        uint64_t overlay_nodes_sum = atomic_load_explicit(&t->stat_overlay_nodes_sum, memory_order_relaxed);
+        uint64_t overlay_nodes_max = atomic_load_explicit(&t->stat_overlay_nodes_max, memory_order_relaxed);
+        uint64_t queue_depth_sum = atomic_load_explicit(&t->stat_queue_depth_sum, memory_order_relaxed);
+        uint64_t queue_depth_max = atomic_load_explicit(&t->stat_queue_depth_max, memory_order_relaxed);
+        uint64_t queue_depth_samples = atomic_load_explicit(&t->stat_queue_depth_samples, memory_order_relaxed);
+        uint64_t concurrent_writers_max = atomic_load_explicit(&t->stat_concurrent_writers_max, memory_order_relaxed);
+
+        /* Calculate derived metrics */
         double avg_joins_per_tx = (tx_starts > 0) ? ((double)tx_joins / (double)tx_starts) : 0.0;
         double waiter_ratio = (tx_joins > 0) ? ((double)tx_waiters / (double)tx_joins) : 0.0;
         double avg_overlay_nodes = (tx_winners > 0) ? ((double)overlay_nodes_sum / (double)tx_winners) : 0.0;
+        double avg_queue_depth = (queue_depth_samples > 0) ? ((double)queue_depth_sum / (double)queue_depth_samples) : 0.0;
         double append_lat_avg_us = (append_lat_ns_samples > 0) ? ((double)append_lat_ns_sum / (double)append_lat_ns_samples / 1000.0) : 0.0;
         double batch_lat_avg_us = (batch_lat_ns_samples > 0) ? ((double)batch_lat_ns_sum / (double)batch_lat_ns_samples / 1000.0) : 0.0;
         double sort_lat_avg_us = (sort_lat_ns_samples > 0) ? ((double)sort_lat_ns_sum / (double)sort_lat_ns_samples / 1000.0) : 0.0;
@@ -2049,33 +2044,26 @@ void cow_close(cow_tree *t)
         double flush_lat_avg_us = (flush_lat_ns_samples > 0) ? ((double)flush_lat_ns_sum / (double)flush_lat_ns_samples / 1000.0) : 0.0;
 
         fprintf(stderr,
-                "[btrfs1] page_cache tl_hit=%lu ram_hit=%lu disk_reads=%lu\n"
-                "[btrfs1] direct_tx starts=%lu joins=%lu winners=%lu waiters=%lu\n"
-                "[btrfs1] direct_tx joins_per_tx=%.2f waiter_ratio=%.2f\n"
-                "[btrfs1] overlay_nodes avg=%.2f max=%lu\n"
-                "[btrfs1] append_retries=%lu zone_rotations=%lu\n"
-                "[btrfs1] sampled_latency_us append=%.2f batch=%.2f\n"
-                "[btrfs1] sampled_stage_us sort=%.2f apply=%.2f flush=%.2f\n"
-                "[btrfs1] page_appends=%lu\n",
-                (unsigned long)tl_hit,
-                (unsigned long)ram_hit,
-                (unsigned long)disk_reads,
+                "[btrfs1] TX_PARALLELISM: starts=%lu joins=%.0f joins_per_tx=%.2f winners=%lu waiters=%lu waiter_ratio=%.2f\n"
+                "[btrfs1] STAGE_LATENCY_US: append=%.2f batch=%.2f sort=%.2f apply=%.2f flush=%.2f\n"
+                "[btrfs1] OVERLAY_CONTENTION: nodes_avg=%.2f nodes_max=%lu queue_depth_avg=%.2f queue_depth_max=%lu\n"
+                "[btrfs1] TX_BOTTLENECK: concurrent_writers_max=%lu\n",
                 (unsigned long)tx_starts,
-                (unsigned long)tx_joins,
+                (double)tx_joins,
+                avg_joins_per_tx,
                 (unsigned long)tx_winners,
                 (unsigned long)tx_waiters,
-                avg_joins_per_tx,
                 waiter_ratio,
-                avg_overlay_nodes,
-                (unsigned long)overlay_nodes_max,
-                (unsigned long)append_retries,
-                (unsigned long)zone_rotations,
                 append_lat_avg_us,
                 batch_lat_avg_us,
                 sort_lat_avg_us,
                 apply_lat_avg_us,
                 flush_lat_avg_us,
-                (unsigned long)appends);
+                avg_overlay_nodes,
+                (unsigned long)overlay_nodes_max,
+                avg_queue_depth,
+                (unsigned long)queue_depth_max,
+                (unsigned long)concurrent_writers_max);
     }
 
     atomic_store_explicit(&t->flusher_stop, true, memory_order_release);
@@ -2202,6 +2190,12 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
 
     my_epoch = t->direct_tx_epoch;
     t->direct_tx_participants++;
+
+    /* Track max concurrent writers */
+    if (t->direct_tx_participants > atomic_load_explicit(&t->stat_concurrent_writers_max, memory_order_relaxed))
+    {
+        atomic_store_explicit(&t->stat_concurrent_writers_max, t->direct_tx_participants, memory_order_relaxed);
+    }
 
     atomic_fetch_add_explicit(&t->stat_tx_joins, 1, memory_order_relaxed);
 
