@@ -154,6 +154,12 @@ typedef struct
     /* Direct tx session shared by main workers */
     pthread_mutex_t direct_tx_lock;
     pthread_cond_t direct_tx_cv;
+    pthread_t direct_committer_tid;
+    pthread_mutex_t direct_commit_q_lock;
+    pthread_cond_t direct_commit_q_cv;
+    void *direct_commit_q_head;
+    void *direct_commit_q_tail;
+    _Atomic(bool) direct_committer_stop;
     uint64_t direct_tx_epoch;
     uint64_t direct_tx_committed_epoch;
     uint64_t direct_tx_participants;      /* 이 TX에 참여한 총 worker 수 (감소 안 함) */
@@ -163,7 +169,11 @@ typedef struct
     bool direct_tx_closed;    /* TX가 만석(participants == expected_workers)이므로 새 참여자를 받지 않음 */
     uint64_t direct_tx_root_id;
     void *direct_tx_overlay;
+    void *direct_tx_ctx_active; /* Active apply TX context */
+    void *direct_tx_handoff;    /* Latest apply-completed TX context for root handoff */
     int expected_workers;
+    uint64_t direct_tx_open_ns; /* Current TX open timestamp (monotonic ns) */
+    uint32_t direct_tx_close_wait_us; /* Early-close timeout for underfilled TX */
 
     /* Throughput & Latency Stats */
     _Atomic(uint64_t) stat_batches;

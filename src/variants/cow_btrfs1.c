@@ -41,9 +41,10 @@ typedef struct
     pagenum_t flushed_pn;
 } overlay_node;
 
-typedef struct
+typedef struct overlay_state
 {
     cow_tree *t;
+    struct overlay_state *parent;
     overlay_node *arr;
     size_t len;
     size_t cap;
@@ -55,6 +56,16 @@ typedef struct
     pthread_mutex_t root_lock;
     pthread_mutex_t node_locks[NODE_LOCK_STRIPES];
 } overlay_state;
+
+typedef struct tx_commit_ctx
+{
+    overlay_state *ov;
+    node_id_t root_id;
+    struct tx_commit_ctx *parent;
+    struct tx_commit_ctx *next;
+    _Atomic(uint32_t) refcnt;
+    uint64_t epoch;
+} tx_commit_ctx;
 
 typedef struct
 {
@@ -1034,6 +1045,39 @@ static void overlay_index_insert(overlay_state *ov, node_id_t id, size_t idx)
     ov->idx_used++;
 }
 
+static int overlay_lookup_chain_node(overlay_state *ov, node_id_t id, page *out)
+{
+    for (overlay_state *cur = ov->parent; cur; cur = cur->parent)
+    {
+        pthread_rwlock_rdlock(&cur->map_rwlock);
+        int idx = overlay_find_idx(cur, id);
+        if (idx >= 0)
+        {
+            *out = cur->arr[idx].node;
+            pthread_rwlock_unlock(&cur->map_rwlock);
+            return 1;
+        }
+        pthread_rwlock_unlock(&cur->map_rwlock);
+    }
+    return 0;
+}
+
+static overlay_state *overlay_find_owner(overlay_state *ov, node_id_t id, int *idx_out)
+{
+    for (overlay_state *cur = ov; cur; cur = cur->parent)
+    {
+        pthread_rwlock_rdlock(&cur->map_rwlock);
+        int idx = overlay_find_idx(cur, id);
+        pthread_rwlock_unlock(&cur->map_rwlock);
+        if (idx >= 0)
+        {
+            *idx_out = idx;
+            return cur;
+        }
+    }
+    return NULL;
+}
+
 static overlay_node *overlay_add_node(overlay_state *ov, node_id_t id, const page *src)
 {
     if (ov->len == ov->cap)
@@ -1067,16 +1111,20 @@ static overlay_node *overlay_get_mut(overlay_state *ov, node_id_t id)
         return ret;
     }
 
-    if (is_temp_id(id))
-    {
-        pthread_rwlock_unlock(&ov->map_rwlock);
-        return NULL;
-    }
-
     pthread_rwlock_unlock(&ov->map_rwlock);
 
     page p;
-    load_page(ov->t, (pagenum_t)id, &p);
+    if (is_temp_id(id))
+    {
+        if (!overlay_lookup_chain_node(ov, id, &p))
+        {
+            return NULL;
+        }
+    }
+    else
+    {
+        load_page(ov->t, (pagenum_t)id, &p);
+    }
 
     pthread_rwlock_wrlock(&ov->map_rwlock);
     idx = overlay_find_idx(ov, id);
@@ -1392,17 +1440,19 @@ static pagenum_t flush_overlay_node(overlay_state *ov, node_id_t id)
     if (id == INVALID_PGN)
         return INVALID_PGN;
 
-    if (!is_temp_id(id))
+    int idx = -1;
+    overlay_state *owner = overlay_find_owner(ov, id, &idx);
+
+    if (!owner)
     {
-        int ridx = overlay_find_idx(ov, id);
-        if (ridx < 0)
+        if (!is_temp_id(id))
             return (pagenum_t)id;
+        exit(EXIT_FAILURE);
     }
 
-    int idx = overlay_find_idx(ov, id);
-    if (idx < 0)
+    if (owner != ov)
     {
-        exit(EXIT_FAILURE);
+        return flush_overlay_node(owner, id);
     }
 
     overlay_node *n = &ov->arr[idx];
@@ -1487,6 +1537,114 @@ static void overlay_destroy_for_tx(overlay_state *ov)
     free(ov->arr);
     free(ov->idx_table);
     free(ov);
+}
+
+static tx_commit_ctx *tx_ctx_alloc(overlay_state *ov, node_id_t root_id, uint64_t epoch, tx_commit_ctx *parent)
+{
+    tx_commit_ctx *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx)
+    {
+        perror("calloc tx_commit_ctx");
+        exit(EXIT_FAILURE);
+    }
+    ctx->ov = ov;
+    ctx->root_id = root_id;
+    ctx->epoch = epoch;
+    ctx->parent = parent;
+    atomic_store_explicit(&ctx->refcnt, 1, memory_order_relaxed);
+    if (parent)
+    {
+        atomic_fetch_add_explicit(&parent->refcnt, 1, memory_order_relaxed);
+    }
+    return ctx;
+}
+
+static void tx_ctx_retain(tx_commit_ctx *ctx)
+{
+    if (!ctx)
+        return;
+    atomic_fetch_add_explicit(&ctx->refcnt, 1, memory_order_relaxed);
+}
+
+static void tx_ctx_release(tx_commit_ctx *ctx)
+{
+    while (ctx)
+    {
+        if (atomic_fetch_sub_explicit(&ctx->refcnt, 1, memory_order_acq_rel) != 1)
+            return;
+
+        tx_commit_ctx *parent = ctx->parent;
+        overlay_destroy_for_tx(ctx->ov);
+        free(ctx);
+        ctx = parent;
+    }
+}
+
+static void enqueue_commit_ctx(cow_tree *t, tx_commit_ctx *ctx)
+{
+    pthread_mutex_lock(&t->direct_commit_q_lock);
+    ctx->next = NULL;
+    if (t->direct_commit_q_tail)
+    {
+        ((tx_commit_ctx *)t->direct_commit_q_tail)->next = ctx;
+    }
+    else
+    {
+        t->direct_commit_q_head = ctx;
+    }
+    t->direct_commit_q_tail = ctx;
+    pthread_cond_signal(&t->direct_commit_q_cv);
+    pthread_mutex_unlock(&t->direct_commit_q_lock);
+}
+
+static void *direct_committer_main(void *arg)
+{
+    cow_tree *t = (cow_tree *)arg;
+
+    for (;;)
+    {
+        pthread_mutex_lock(&t->direct_commit_q_lock);
+        while (!t->direct_commit_q_head &&
+               !atomic_load_explicit(&t->direct_committer_stop, memory_order_acquire))
+        {
+            pthread_cond_wait(&t->direct_commit_q_cv, &t->direct_commit_q_lock);
+        }
+
+        if (!t->direct_commit_q_head &&
+            atomic_load_explicit(&t->direct_committer_stop, memory_order_acquire))
+        {
+            pthread_mutex_unlock(&t->direct_commit_q_lock);
+            break;
+        }
+
+        tx_commit_ctx *ctx = (tx_commit_ctx *)t->direct_commit_q_head;
+        t->direct_commit_q_head = ctx->next;
+        if (!t->direct_commit_q_head)
+            t->direct_commit_q_tail = NULL;
+        pthread_mutex_unlock(&t->direct_commit_q_lock);
+
+        pagenum_t new_root = (ctx->root_id == INVALID_PGN)
+                                 ? INVALID_PGN
+                                 : flush_overlay_node(ctx->ov, ctx->root_id);
+
+        atomic_fetch_add_explicit(&t->stat_overlay_nodes_sum, (uint64_t)ctx->ov->len, memory_order_relaxed);
+        stat_update_max_u64(&t->stat_overlay_nodes_max, (uint64_t)ctx->ov->len);
+
+                pthread_mutex_lock(&t->direct_tx_lock);
+                /* If this committed ctx is still used as handoff, expose persisted root.
+                     New TX can then rebase without inheriting a long parent overlay chain. */
+                ctx->root_id = (node_id_t)new_root;
+        t->direct_tx_committed_epoch = ctx->epoch;
+        pthread_cond_broadcast(&t->direct_tx_cv);
+        pthread_mutex_unlock(&t->direct_tx_lock);
+
+                publish_root_tx_winner(t, new_root);
+                atomic_fetch_add_explicit(&t->stat_tx_commit_winners, 1, memory_order_relaxed);
+
+        tx_ctx_release(ctx); /* queue ownership */
+    }
+
+    return NULL;
 }
 
 static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
@@ -1942,6 +2100,41 @@ cow_tree *cow_open(const char *path)
         free(t);
         return NULL;
     }
+    if (pthread_mutex_init(&t->direct_commit_q_lock, NULL) != 0)
+    {
+        perror("pthread_mutex_init direct_commit_q_lock");
+        pthread_cond_destroy(&t->direct_tx_cv);
+        pthread_mutex_destroy(&t->direct_tx_lock);
+        free(t->zones);
+        free(t->zone_wp_bytes);
+        free(t->zone_full);
+        if (t->direct_fd >= 0)
+            close(t->direct_fd);
+        zbd_close(t->fd);
+        pthread_cond_destroy(&t->q_cv);
+        pthread_mutex_destroy(&t->q_lock);
+        pthread_mutex_destroy(&t->flush_lock);
+        free(t);
+        return NULL;
+    }
+    if (pthread_cond_init(&t->direct_commit_q_cv, NULL) != 0)
+    {
+        perror("pthread_cond_init direct_commit_q_cv");
+        pthread_mutex_destroy(&t->direct_commit_q_lock);
+        pthread_cond_destroy(&t->direct_tx_cv);
+        pthread_mutex_destroy(&t->direct_tx_lock);
+        free(t->zones);
+        free(t->zone_wp_bytes);
+        free(t->zone_full);
+        if (t->direct_fd >= 0)
+            close(t->direct_fd);
+        zbd_close(t->fd);
+        pthread_cond_destroy(&t->q_cv);
+        pthread_mutex_destroy(&t->q_lock);
+        pthread_mutex_destroy(&t->flush_lock);
+        free(t);
+        return NULL;
+    }
 
     t->direct_tx_epoch = 0;
     t->direct_tx_committed_epoch = 0;
@@ -1952,11 +2145,43 @@ cow_tree *cow_open(const char *path)
     t->direct_tx_closed = false;
     t->direct_tx_root_id = (uint64_t)INVALID_PGN;
     t->direct_tx_overlay = NULL;
+    t->direct_tx_ctx_active = NULL;
+    t->direct_tx_handoff = NULL;
+    t->direct_commit_q_head = NULL;
+    t->direct_commit_q_tail = NULL;
     t->expected_workers = 64;  /* Default to max expected; should be overridden by cow_set_expected_workers */
+    t->direct_tx_open_ns = 0;
+    t->direct_tx_close_wait_us = 50; /* Close underfilled TX after short wait to reduce stall */
+    atomic_store_explicit(&t->direct_committer_stop, false, memory_order_release);
+
+    if (pthread_create(&t->direct_committer_tid, NULL, direct_committer_main, t) != 0)
+    {
+        perror("pthread_create direct_committer");
+        pthread_cond_destroy(&t->direct_commit_q_cv);
+        pthread_mutex_destroy(&t->direct_commit_q_lock);
+        pthread_cond_destroy(&t->direct_tx_cv);
+        pthread_mutex_destroy(&t->direct_tx_lock);
+        free(t->zones);
+        free(t->zone_wp_bytes);
+        free(t->zone_full);
+        if (t->direct_fd >= 0)
+            close(t->direct_fd);
+        zbd_close(t->fd);
+        pthread_cond_destroy(&t->q_cv);
+        pthread_mutex_destroy(&t->q_lock);
+        pthread_mutex_destroy(&t->flush_lock);
+        free(t);
+        return NULL;
+    }
 
     if (pthread_create(&t->flusher_tid, NULL, sb_flusher_thread, t) != 0)
     {
         perror("pthread_create flusher");
+        atomic_store_explicit(&t->direct_committer_stop, true, memory_order_release);
+        pthread_cond_broadcast(&t->direct_commit_q_cv);
+        pthread_join(t->direct_committer_tid, NULL);
+        pthread_cond_destroy(&t->direct_commit_q_cv);
+        pthread_mutex_destroy(&t->direct_commit_q_lock);
         pthread_cond_destroy(&t->direct_tx_cv);
         pthread_mutex_destroy(&t->direct_tx_lock);
         free(t->zones);
@@ -1981,48 +2206,42 @@ void cow_close(cow_tree *t)
         return;
 
     pthread_mutex_lock(&t->direct_tx_lock);
-    while (t->direct_tx_committing)
+    if (t->direct_tx_active &&
+        t->direct_tx_overlay &&
+        t->direct_tx_participants > 0)
     {
-        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
-    }
-
-    /* If current TX is closed but not fully completed, wait for completion.
-       This prevents extra workers from joining a full TX. */
-    while (t->direct_tx_active &&
-           t->direct_tx_closed &&
-           t->direct_tx_completed < t->direct_tx_participants)
-    {
-        atomic_fetch_add_explicit(&t->stat_tx_commit_waiters, 1, memory_order_relaxed);
-        pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
-
-        while (t->direct_tx_committing)
+        t->direct_tx_closed = true;
+        while (t->direct_tx_completed < t->direct_tx_participants)
         {
             pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
         }
-    }
 
-    if (t->direct_tx_active &&
-        t->direct_tx_overlay &&
-        t->direct_tx_completed == t->direct_tx_participants)
-    {
-        overlay_state *ov = (overlay_state *)t->direct_tx_overlay;
-        node_id_t root_id = (node_id_t)t->direct_tx_root_id;
+        tx_commit_ctx *ctx = (tx_commit_ctx *)t->direct_tx_ctx_active;
+        if (ctx)
+        {
+            ctx->root_id = (node_id_t)t->direct_tx_root_id;
+            ctx->epoch = t->direct_tx_epoch;
 
-        t->direct_tx_active = false;
-        t->direct_tx_overlay = NULL;
-        t->direct_tx_committing = true;
-        pthread_mutex_unlock(&t->direct_tx_lock);
+            tx_ctx_retain(ctx); /* queue ownership */
+            enqueue_commit_ctx(t, ctx);
 
-        pagenum_t new_root = (root_id == INVALID_PGN) ? INVALID_PGN : flush_overlay_node(ov, root_id);
-        publish_root_tx_winner(t, new_root);
-        overlay_destroy_for_tx(ov);
+            if (t->direct_tx_handoff)
+                tx_ctx_release((tx_commit_ctx *)t->direct_tx_handoff);
+            tx_ctx_retain(ctx); /* handoff ownership */
+            t->direct_tx_handoff = ctx;
 
-        pthread_mutex_lock(&t->direct_tx_lock);
-        t->direct_tx_committed_epoch = t->direct_tx_epoch;
-        t->direct_tx_committing = false;
-        pthread_cond_broadcast(&t->direct_tx_cv);
+            t->direct_tx_ctx_active = NULL;
+            t->direct_tx_active = false;
+            t->direct_tx_overlay = NULL;
+            tx_ctx_release(ctx); /* active ownership */
+            pthread_cond_broadcast(&t->direct_tx_cv);
+        }
     }
     pthread_mutex_unlock(&t->direct_tx_lock);
+
+    atomic_store_explicit(&t->direct_committer_stop, true, memory_order_release);
+    pthread_cond_broadcast(&t->direct_commit_q_cv);
+    pthread_join(t->direct_committer_tid, NULL);
 
     {
         /* TX structure analysis */
@@ -2100,7 +2319,7 @@ void cow_close(cow_tree *t)
         /* TX 병목 분석: concurrent_writers_max(한 TX에 동시 참여한 최대 워커 수=총_스레드_수 이상일 수 없음).
            참고: joins_per_tx >> concurrent_writers_max인 것이 정상! 많은 inserts가 배치로 묶이기 때문 */
         fprintf(stderr,
-                "[btrfs1] TX_BOTTLENECK: concurrent_writers_max=%lu (한 TX 동시 워커)\n",
+                "[btrfs1] TX_BOTTLENECK: concurrent_writers_max=%lu\n",
                 (unsigned long)concurrent_writers_max);
     }
 
@@ -2135,6 +2354,19 @@ void cow_close(cow_tree *t)
 
     pthread_cond_destroy(&t->direct_tx_cv);
     pthread_mutex_destroy(&t->direct_tx_lock);
+    pthread_cond_destroy(&t->direct_commit_q_cv);
+    pthread_mutex_destroy(&t->direct_commit_q_lock);
+
+    if (t->direct_tx_handoff)
+    {
+        tx_ctx_release((tx_commit_ctx *)t->direct_tx_handoff);
+        t->direct_tx_handoff = NULL;
+    }
+    if (t->direct_tx_ctx_active)
+    {
+        tx_ctx_release((tx_commit_ctx *)t->direct_tx_ctx_active);
+        t->direct_tx_ctx_active = NULL;
+    }
 
     /* Cleanup transaction state machine */
     if (t->current_tx)
@@ -2194,6 +2426,14 @@ void cow_set_expected_workers(cow_tree *t, int workers)
     if (workers < 1)
         workers = 1;
     t->expected_workers = workers;
+
+    /* Adaptive close-wait: avoid tiny batches at higher thread counts. */
+    uint32_t wait_us = (uint32_t)(workers * 40);
+    if (wait_us < 100)
+        wait_us = 100;
+    if (wait_us > 2000)
+        wait_us = 2000;
+    t->direct_tx_close_wait_us = wait_us;
 }
 
 void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
@@ -2205,7 +2445,10 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
 
     for (;;)
     {
-        while (t->direct_tx_committing)
+        /* Keep at most 2 outstanding TX contexts (apply + commit pipeline).
+           This prevents unbounded handoff-chain growth. */
+        while (!t->direct_tx_active &&
+               (t->direct_tx_epoch - t->direct_tx_committed_epoch) >= 2)
         {
             pthread_cond_wait(&t->direct_tx_cv, &t->direct_tx_lock);
         }
@@ -2214,21 +2457,54 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
         {
             pagenum_t root;
             uint64_t seq;
+            tx_commit_ctx *handoff_ctx = (tx_commit_ctx *)t->direct_tx_handoff;
+            tx_commit_ctx *parent_ctx = NULL;
 
-            read_tree_snapshot(t, &root, &seq);
+            if (handoff_ctx)
+            {
+                root = (pagenum_t)handoff_ctx->root_id;
+                seq = t->direct_tx_epoch + 1;
+
+                /* Only inherit overlay parent when handoff TX is not yet committed.
+                   Committed handoff can safely rebase as persisted root-only. */
+                if (handoff_ctx->epoch > t->direct_tx_committed_epoch)
+                    parent_ctx = handoff_ctx;
+            }
+            else
+            {
+                read_tree_snapshot(t, &root, &seq);
+            }
             (void)seq;
 
             ov = overlay_create_for_tx(t);
+            ov->parent = parent_ctx ? parent_ctx->ov : NULL;
+
+            t->direct_tx_epoch++;
+            tx_commit_ctx *ctx = tx_ctx_alloc(ov, (node_id_t)root, t->direct_tx_epoch, parent_ctx);
 
             t->direct_tx_overlay = ov;
             t->direct_tx_root_id = (uint64_t)root;
+            t->direct_tx_ctx_active = ctx;
             t->direct_tx_active = true;
             t->direct_tx_closed = false;
             t->direct_tx_participants = 0;
             t->direct_tx_completed = 0;
-            t->direct_tx_epoch++;
+            t->direct_tx_open_ns = monotonic_ns();
 
             atomic_fetch_add_explicit(&t->stat_tx_starts, 1, memory_order_relaxed);
+        }
+
+        /* Early-close policy: if TX stays underfilled longer than timeout, close it. */
+        if (!t->direct_tx_closed &&
+            t->direct_tx_participants > 0 &&
+            t->direct_tx_participants < (uint64_t)t->expected_workers)
+        {
+            uint64_t now_ns = monotonic_ns();
+            uint64_t wait_ns = (uint64_t)t->direct_tx_close_wait_us * 1000ULL;
+            if (now_ns - t->direct_tx_open_ns >= wait_ns)
+            {
+                t->direct_tx_closed = true;
+            }
         }
 
         /* Hard cap: once TX is closed/full, newcomers must wait. */
@@ -2270,44 +2546,45 @@ void cow_insert_direct(cow_tree *t, int64_t key, const char *value)
     pthread_mutex_lock(&t->direct_tx_lock);
     t->direct_tx_completed++;
 
+    /* Progress guarantee for underfilled TX: if no in-flight apply remains,
+       close now so this batch can be enqueued for commit. */
+    if (!t->direct_tx_closed &&
+        t->direct_tx_participants > 0 &&
+        t->direct_tx_participants < (uint64_t)t->expected_workers &&
+        t->direct_tx_completed == t->direct_tx_participants)
+    {
+        t->direct_tx_closed = true;
+    }
+
     /* Wake waiters when completion progresses. */
     pthread_cond_broadcast(&t->direct_tx_cv);
 
-    /* Trigger commit when all expected workers have completed their apply phase */
+    /* Trigger commit when this TX is closed and all joined workers completed apply. */
     if (t->direct_tx_active &&
         t->direct_tx_epoch == my_epoch &&
-        t->direct_tx_participants == t->expected_workers &&
-        t->direct_tx_completed == t->direct_tx_participants &&
-        !t->direct_tx_committing)
+        t->direct_tx_closed &&
+        t->direct_tx_participants > 0 &&
+        t->direct_tx_completed == t->direct_tx_participants)
     {
-        /* Last worker performs commit (other workers have already returned) */
-        overlay_state *commit_ov = (overlay_state *)t->direct_tx_overlay;
-        node_id_t commit_root = (node_id_t)t->direct_tx_root_id;
-        uint64_t committed_epoch = t->direct_tx_epoch;
+        tx_commit_ctx *ctx = (tx_commit_ctx *)t->direct_tx_ctx_active;
+        if (ctx)
+        {
+            ctx->root_id = (node_id_t)t->direct_tx_root_id;
+            ctx->epoch = t->direct_tx_epoch;
 
-        /* Atomically transition to next epoch to prevent new wave from entering */
-        t->direct_tx_overlay = NULL;
-        t->direct_tx_active = false;
-        t->direct_tx_epoch++;  /* Increment epoch BEFORE commit so new workers wait */
-        t->direct_tx_committing = true;
-        atomic_fetch_add_explicit(&t->stat_tx_commit_winners, 1, memory_order_relaxed);
+            tx_ctx_retain(ctx); /* queue ownership */
+            enqueue_commit_ctx(t, ctx);
 
-        pthread_mutex_unlock(&t->direct_tx_lock);
+            if (t->direct_tx_handoff)
+                tx_ctx_release((tx_commit_ctx *)t->direct_tx_handoff);
+            tx_ctx_retain(ctx); /* handoff ownership */
+            t->direct_tx_handoff = ctx;
 
-        pagenum_t new_root = (commit_root == INVALID_PGN)
-                                 ? INVALID_PGN
-                                 : flush_overlay_node(commit_ov, commit_root);
-
-        atomic_fetch_add_explicit(&t->stat_overlay_nodes_sum, (uint64_t)commit_ov->len, memory_order_relaxed);
-        stat_update_max_u64(&t->stat_overlay_nodes_max, (uint64_t)commit_ov->len);
-
-        publish_root_tx_winner(t, new_root);
-
-        overlay_destroy_for_tx(commit_ov);
-
-        pthread_mutex_lock(&t->direct_tx_lock);
-        t->direct_tx_committed_epoch = committed_epoch;
-        t->direct_tx_committing = false;
+            t->direct_tx_ctx_active = NULL;
+            t->direct_tx_overlay = NULL;
+            t->direct_tx_active = false;
+            tx_ctx_release(ctx); /* active ownership */
+        }
         pthread_cond_broadcast(&t->direct_tx_cv);
     }
 
