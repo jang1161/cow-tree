@@ -156,18 +156,18 @@ static _Atomic(uint64_t) g_pages_appended;
 /* ─────────────────── Per-run metrics ─────────────────── */
 typedef struct
 {
-    _Atomic uint64_t tx_count;            /* TXs actually flushed              */
-    _Atomic uint64_t tx_joined_sum;       /* sum of joined counts per TX        */
-    _Atomic uint64_t tx_closed_by_count;  /* TXs closed because joined==expected*/
-    _Atomic uint64_t tx_closed_by_timeout;/* TXs closed by timeout              */
-    _Atomic uint64_t flush_ns_total;      /* wall time inside flush_tree (flusher thread) */
-    _Atomic uint64_t nvme_ns_total;       /* wall time inside zone_append_n     */
-    _Atomic uint64_t insert_ns_total;     /* sum of tree_insert() times         */
-    _Atomic uint64_t entry_wait_ns_total; /* time waiting to join TX (phase 1)  */
-    _Atomic uint64_t epoch_wait_ns_total; /* time waiting for TX completion      */
-    _Atomic uint64_t dirty_nodes_total;   /* total dirty nodes flushed           */
-    _Atomic uint64_t zone_advance_count;  /* number of zone transitions          */
-    _Atomic uint64_t restart_count;       /* wrlock-mode restarts in tree_insert */
+    _Atomic uint64_t tx_count;             /* TXs actually flushed              */
+    _Atomic uint64_t tx_joined_sum;        /* sum of joined counts per TX        */
+    _Atomic uint64_t tx_closed_by_count;   /* TXs closed because joined==expected*/
+    _Atomic uint64_t tx_closed_by_timeout; /* TXs closed by timeout              */
+    _Atomic uint64_t flush_ns_total;       /* wall time inside flush_tree (flusher thread) */
+    _Atomic uint64_t nvme_ns_total;        /* wall time inside zone_append_n     */
+    _Atomic uint64_t insert_ns_total;      /* sum of tree_insert() times         */
+    _Atomic uint64_t entry_wait_ns_total;  /* time waiting to join TX (phase 1)  */
+    _Atomic uint64_t epoch_wait_ns_total;  /* time waiting for TX completion      */
+    _Atomic uint64_t dirty_nodes_total;    /* total dirty nodes flushed           */
+    _Atomic uint64_t zone_advance_count;   /* number of zone transitions          */
+    _Atomic uint64_t restart_count;        /* wrlock-mode restarts in tree_insert */
 } run_metrics_t;
 
 static run_metrics_t g_metrics;
@@ -229,10 +229,10 @@ static int zone_append_n(uint32_t zone_id, const void *buf, int n_pages,
     if (nret != 0)
     {
         fprintf(stderr, "nvme_zns_append zone=%u zslba=%llu nlb=%u data_len=%u: "
-                "ret=0x%x errno=%d(%s)\n"
-                "  [state at error] g_zone_wp=%lu  zone_cap=%lu  "
-                "capacity_raw=0x%llx  start_raw=0x%llx  len_raw=0x%llx  "
-                "lblock=%u  total_lb=%u\n",
+                        "ret=0x%x errno=%d(%s)\n"
+                        "  [state at error] g_zone_wp=%lu  zone_cap=%lu  "
+                        "capacity_raw=0x%llx  start_raw=0x%llx  len_raw=0x%llx  "
+                        "lblock=%u  total_lb=%u\n",
                 zone_id, (unsigned long long)zslba, (unsigned)nlb,
                 (unsigned)(n_pages * PAGE_SIZE),
                 (unsigned)nret, errno, strerror(errno),
@@ -453,7 +453,7 @@ static void tree_insert(int64_t key, const char *value)
     int hs_n = 0;
     bool cur_rdlocked = false;
     nid_t cur = NID_NULL;
-    bool wrlock_mode = false; /* set on restart; skip rdlock zone entirely */
+    bool wrlock_mode = true; /* always wrlock; rdlock saves nothing for insert-only workload */
 
     typedef struct
     {
@@ -947,9 +947,10 @@ static void tx_insert(int64_t key, const char *value)
                 uint64_t wait_ns = deadline_ns - now_ns;
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec  += (time_t)(wait_ns / 1000000000ULL);
+                ts.tv_sec += (time_t)(wait_ns / 1000000000ULL);
                 ts.tv_nsec += (long)(wait_ns % 1000000000ULL);
-                if (ts.tv_nsec >= 1000000000L) {
+                if (ts.tv_nsec >= 1000000000L)
+                {
                     ts.tv_sec++;
                     ts.tv_nsec -= 1000000000L;
                 }
@@ -967,8 +968,19 @@ static void tx_insert(int64_t key, const char *value)
                     atomic_fetch_add_explicit(&g_metrics.tx_closed_by_timeout, 1,
                                               memory_order_relaxed);
                     do_tx_flush(joined_snap);
+                    /* epoch was incremented; outer while-condition will exit */
                 }
-                break;
+                else
+                {
+                    /*
+                     * Someone else is the flusher (flushing=true or TX still has
+                     * pending inserts). Don't busy-loop past the deadline: wait
+                     * for the real flusher to broadcast when it finishes.
+                     * No timeout needed — the flusher WILL complete and broadcast.
+                     */
+                    pthread_cond_wait(&g_tx.cond, &g_tx.lock);
+                }
+                /* No break: re-check while (g_tx.epoch == my_epoch) */
             }
         }
         atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
@@ -1164,49 +1176,49 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
            elapsed, tput, (unsigned long)pages, (unsigned)nodes);
 
     /* ── Detailed metrics ── */
-    uint64_t tx_n       = atomic_load_explicit(&g_metrics.tx_count,             memory_order_relaxed);
-    uint64_t joined_sum = atomic_load_explicit(&g_metrics.tx_joined_sum,        memory_order_relaxed);
-    uint64_t by_count   = atomic_load_explicit(&g_metrics.tx_closed_by_count,   memory_order_relaxed);
+    uint64_t tx_n = atomic_load_explicit(&g_metrics.tx_count, memory_order_relaxed);
+    uint64_t joined_sum = atomic_load_explicit(&g_metrics.tx_joined_sum, memory_order_relaxed);
+    uint64_t by_count = atomic_load_explicit(&g_metrics.tx_closed_by_count, memory_order_relaxed);
     uint64_t by_timeout = atomic_load_explicit(&g_metrics.tx_closed_by_timeout, memory_order_relaxed);
-    uint64_t flush_ns   = atomic_load_explicit(&g_metrics.flush_ns_total,       memory_order_relaxed);
-    uint64_t nvme_ns    = atomic_load_explicit(&g_metrics.nvme_ns_total,        memory_order_relaxed);
-    uint64_t ins_ns     = atomic_load_explicit(&g_metrics.insert_ns_total,      memory_order_relaxed);
-    uint64_t entry_ns   = atomic_load_explicit(&g_metrics.entry_wait_ns_total,  memory_order_relaxed);
-    uint64_t epoch_ns   = atomic_load_explicit(&g_metrics.epoch_wait_ns_total,  memory_order_relaxed);
-    uint64_t dirty_tot  = atomic_load_explicit(&g_metrics.dirty_nodes_total,    memory_order_relaxed);
-    uint64_t zone_adv   = atomic_load_explicit(&g_metrics.zone_advance_count,   memory_order_relaxed);
-    uint64_t restarts   = atomic_load_explicit(&g_metrics.restart_count,        memory_order_relaxed);
+    uint64_t flush_ns = atomic_load_explicit(&g_metrics.flush_ns_total, memory_order_relaxed);
+    uint64_t nvme_ns = atomic_load_explicit(&g_metrics.nvme_ns_total, memory_order_relaxed);
+    uint64_t ins_ns = atomic_load_explicit(&g_metrics.insert_ns_total, memory_order_relaxed);
+    uint64_t entry_ns = atomic_load_explicit(&g_metrics.entry_wait_ns_total, memory_order_relaxed);
+    uint64_t epoch_ns = atomic_load_explicit(&g_metrics.epoch_wait_ns_total, memory_order_relaxed);
+    uint64_t dirty_tot = atomic_load_explicit(&g_metrics.dirty_nodes_total, memory_order_relaxed);
+    uint64_t zone_adv = atomic_load_explicit(&g_metrics.zone_advance_count, memory_order_relaxed);
+    uint64_t restarts = atomic_load_explicit(&g_metrics.restart_count, memory_order_relaxed);
 
-    double avg_joined  = tx_n ? (double)joined_sum / tx_n : 0.0;
-    double avg_dirty   = tx_n ? (double)dirty_tot  / tx_n : 0.0;
-    double avg_flush_ms= tx_n ? (double)flush_ns / tx_n / 1e6 : 0.0;
+    double avg_joined = tx_n ? (double)joined_sum / tx_n : 0.0;
+    double avg_dirty = tx_n ? (double)dirty_tot / tx_n : 0.0;
+    double avg_flush_ms = tx_n ? (double)flush_ns / tx_n / 1e6 : 0.0;
     double total_flush_ms = (double)flush_ns / 1e6;
-    double total_nvme_ms  = (double)nvme_ns  / 1e6;
-    double nvme_pct    = flush_ns ? (double)nvme_ns / flush_ns * 100.0 : 0.0;
-    double ins_s       = (double)ins_ns   / 1e9;
-    double entry_s     = (double)entry_ns / 1e9;
-    double epoch_s     = (double)epoch_ns / 1e9;
+    double total_nvme_ms = (double)nvme_ns / 1e6;
+    double nvme_pct = flush_ns ? (double)nvme_ns / flush_ns * 100.0 : 0.0;
+    double ins_s = (double)ins_ns / 1e9;
+    double entry_s = (double)entry_ns / 1e9;
+    double epoch_s = (double)epoch_ns / 1e9;
     uint64_t closed_total = by_count + by_timeout;
-    double by_count_pct   = closed_total ? (double)by_count   / closed_total * 100.0 : 0.0;
+    double by_count_pct = closed_total ? (double)by_count / closed_total * 100.0 : 0.0;
     double by_timeout_pct = closed_total ? (double)by_timeout / closed_total * 100.0 : 0.0;
-    double restarts_per   = num_keys ? (double)restarts / num_keys : 0.0;
+    double restarts_per = num_keys ? (double)restarts / num_keys : 0.0;
 
     printf("  [TX]\n");
-    printf("    total TXs:            %lu\n",      (unsigned long)tx_n);
+    printf("    total TXs:            %lu\n", (unsigned long)tx_n);
     printf("    avg threads/TX:       %.2f  (expected=%d)\n", avg_joined, num_threads);
-    printf("    closed by count:      %lu  (%.1f%%)\n", (unsigned long)by_count,   by_count_pct);
+    printf("    closed by count:      %lu  (%.1f%%)\n", (unsigned long)by_count, by_count_pct);
     printf("    closed by timeout:    %lu  (%.1f%%)\n", (unsigned long)by_timeout, by_timeout_pct);
     printf("  [Flush]\n");
-    printf("    avg dirty nodes/TX:   %.1f\n",   avg_dirty);
+    printf("    avg dirty nodes/TX:   %.1f\n", avg_dirty);
     printf("    avg flush time:       %.3f ms\n", avg_flush_ms);
     printf("    total flush time:     %.1f ms\n", total_flush_ms);
     printf("    total NVMe I/O time:  %.1f ms  (%.1f%% of flush)\n",
            total_nvme_ms, nvme_pct);
-    printf("    zone advances:        %lu\n",      (unsigned long)zone_adv);
+    printf("    zone advances:        %lu\n", (unsigned long)zone_adv);
     printf("  [Thread time, summed across all threads]\n");
-    printf("    tree_insert:          %.3f s\n",   ins_s);
-    printf("    waiting to join TX:   %.3f s\n",   entry_s);
-    printf("    waiting for epoch:    %.3f s\n",   epoch_s);
+    printf("    tree_insert:          %.3f s\n", ins_s);
+    printf("    waiting to join TX:   %.3f s\n", entry_s);
+    printf("    waiting for epoch:    %.3f s\n", epoch_s);
     printf("  [Contention]\n");
     printf("    wrlock restarts:      %lu  (avg %.4f per insert)\n",
            (unsigned long)restarts, restarts_per);
