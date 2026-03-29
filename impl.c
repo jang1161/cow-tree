@@ -32,6 +32,8 @@
 #define INTERNAL_ORDER 249 /* max 248 keys, 249 children  */
 #define MAX_APPEND_PAGES 64
 #define TX_TIMEOUT_NS (500000ULL) /* 500 µs */
+#define COMMIT_Q_DEPTH 4          /* pipeline depth: queued NVMe batches */
+#define MAX_SERIAL_NODES 2048     /* upper bound on dirty nodes per TX */
 #define META_ZONE 0
 #define DATA_ZONE_START 1
 #define SB_MAGIC 0x434F574252414D31ULL
@@ -160,7 +162,7 @@ typedef struct
     _Atomic uint64_t tx_joined_sum;        /* sum of joined counts per TX        */
     _Atomic uint64_t tx_closed_by_count;   /* TXs closed because joined==expected*/
     _Atomic uint64_t tx_closed_by_timeout; /* TXs closed by timeout              */
-    _Atomic uint64_t flush_ns_total;       /* wall time inside flush_tree (flusher thread) */
+    _Atomic uint64_t flush_ns_total;       /* reserved / unused after pipeline refactor     */
     _Atomic uint64_t nvme_ns_total;        /* wall time inside zone_append_n     */
     _Atomic uint64_t insert_ns_total;      /* sum of tree_insert() times         */
     _Atomic uint64_t entry_wait_ns_total;  /* time waiting to join TX (phase 1)  */
@@ -168,9 +170,45 @@ typedef struct
     _Atomic uint64_t dirty_nodes_total;    /* total dirty nodes flushed           */
     _Atomic uint64_t zone_advance_count;   /* number of zone transitions          */
     _Atomic uint64_t restart_count;        /* wrlock-mode restarts in tree_insert */
+    _Atomic uint64_t serialize_ns_total;   /* parallel serialization time (summed)*/
+    _Atomic uint64_t commit_ns_total;      /* committer NVMe write time           */
+    _Atomic uint64_t commit_wait_ns_total; /* time closer waits for a free slot   */
 } run_metrics_t;
 
 static run_metrics_t g_metrics;
+
+/* ─────────────────── Commit pipeline ─────────────────── */
+/*
+ * One commit_batch_t describes a single TX's pages to write.
+ * Pages are pre-serialized into g_serial_bufs[buf_slot] by workers in parallel.
+ * The committer thread picks up batches and writes them to NVMe asynchronously,
+ * so TX N+1 inserts can overlap with TX N's NVMe write.
+ */
+typedef struct
+{
+    int      n_pages;           /* number of 4KB pages in this batch      */
+    int      buf_slot;          /* which g_serial_bufs[buf_slot] to read  */
+    uint32_t zone_id;           /* zone to append to                      */
+    pgn_t    root_pgn;          /* root page number for the superblock    */
+    bool     needs_zone_finish; /* call zbd_finish_zones before writing   */
+    uint32_t old_zone_id;       /* zone to finish (if needs_zone_finish)  */
+} commit_batch_t;
+
+/* Per-slot write buffers: PAGE_SIZE-aligned for NVMe DMA.
+ * Each slot is owned by one TX batch at a time. */
+static uint8_t g_serial_bufs[COMMIT_Q_DEPTH][MAX_SERIAL_NODES * PAGE_SIZE]
+    __attribute__((aligned(PAGE_SIZE)));
+
+/* Circular commit queue */
+static commit_batch_t g_cq_slots[COMMIT_Q_DEPTH];
+static int g_cq_head;           /* committer reads here    */
+static int g_cq_tail;           /* next slot to fill       */
+static int g_cq_count;          /* items currently queued  */
+static pthread_mutex_t g_cq_lock;
+static pthread_cond_t  g_cq_notempty; /* committer waits when empty */
+static pthread_cond_t  g_cq_notfull;  /* closer waits when full     */
+static bool            g_cq_shutdown;
+static pthread_t       g_committer;
 
 /* ─────────────────── TX machine ─────────────────── */
 typedef struct
@@ -182,9 +220,16 @@ typedef struct
     bool closed;
     bool closed_by_count; /* true if closed because joined==expected */
     bool flushing;
+    bool serializing;     /* true while parallel serialization is in progress */
     uint64_t open_ns;
     pthread_mutex_t lock;
     pthread_cond_t cond;
+
+    /* Parallel serialization state (valid only while serializing=true) */
+    _Atomic int serial_claimed; /* next dfs_order[] index to serialize (atomic) */
+    _Atomic int serial_done;    /* workers finished their serialization duty     */
+    int serial_total;           /* total dirty nodes (= dfs_count at phase1)     */
+    int serial_buf_slot;        /* which g_serial_bufs[] slot workers write into */
 } tx_t;
 
 static tx_t g_tx;
@@ -282,8 +327,7 @@ static void write_superblock(pgn_t root_pn)
 static nid_t *dfs_order; /* pool_cap entries */
 static int dfs_count;
 
-/* Write buffer: PAGE_SIZE-aligned for NVMe DMA */
-static uint8_t g_wbuf[MAX_APPEND_PAGES * PAGE_SIZE] __attribute__((aligned(PAGE_SIZE)));
+/* (write buffers are now g_serial_bufs[] — see commit pipeline above) */
 
 static void dfs_dirty_collect(nid_t nid)
 {
@@ -300,39 +344,80 @@ static void dfs_dirty_collect(nid_t nid)
     dfs_order[dfs_count++] = nid; /* post-order */
 }
 
-static pgn_t flush_tree(void)
+/*
+ * build_disk_page — serialize one RAM node into a 4KB disk page.
+ * Called by each worker thread during the parallel serialization phase.
+ * No locks required: the destination slot is exclusively owned by this call
+ * (workers claim different indices via atomic serial_claimed), and the
+ * source ram_node is read-only once all inserts for this TX have completed.
+ */
+static void build_disk_page(uint8_t *dst, nid_t nid)
 {
+    ram_node *rn = &pool[nid];
+    disk_page *dp = (disk_page *)dst;
+    memset(dp, 0, PAGE_SIZE);
+    dp->is_leaf = rn->is_leaf;
+    dp->num_keys = rn->num_keys;
+    if (rn->is_leaf)
+    {
+        dp->pointer = PGN_NULL;
+        for (uint32_t k = 0; k < rn->num_keys; k++)
+        {
+            dp->leaf[k].key = rn->keys[k];
+            memcpy(dp->leaf[k].value, rn->values[k], 120);
+        }
+    }
+    else
+    {
+        for (uint32_t k = 0; k < rn->num_keys; k++)
+        {
+            dp->internal[k].key = rn->keys[k];
+            dp->internal[k].child = pool[rn->children[k]].pagenum;
+        }
+        dp->pointer = pool[rn->children[rn->num_keys]].pagenum;
+    }
+}
+
+/*
+ * flush_prepare_phase1 — single-threaded fast phase, called by the TX closer
+ * OUTSIDE g_tx.lock.  Does DFS, zone-advance, pagenum assignment.
+ * After this returns, dfs_order[0..dfs_count-1] are stable and pagenums are
+ * assigned.  Workers can immediately build_disk_page() in parallel.
+ * Fills *batch with metadata the committer needs; root_pgn is filled later
+ * by the last serializer.
+ */
+static void flush_prepare_phase1(int buf_slot, commit_batch_t *batch)
+{
+    batch->n_pages = 0; /* will be overwritten if there are dirty nodes */
+
     if (g_root == NID_NULL)
-        return PGN_NULL;
+        return;
 
     dfs_count = 0;
     dfs_dirty_collect(g_root);
     if (dfs_count == 0)
-        return pool[g_root].pagenum;
+        return;
 
     int total = dfs_count;
+    if (total > MAX_SERIAL_NODES)
+    {
+        fprintf(stderr, "flush_prepare_phase1: too many dirty nodes %d > %d\n",
+                total, MAX_SERIAL_NODES);
+        abort();
+    }
+
     atomic_fetch_add_explicit(&g_metrics.dirty_nodes_total, (uint64_t)total,
                               memory_order_relaxed);
 
-    pthread_mutex_lock(&g_dev_lock);
-
-    /* Advance zone if needed */
+    /* Zone advance check (g_cur_zone / g_zone_wp not protected by a lock here
+     * because only one TX closer runs at a time — enforced by flushing=true). */
     uint64_t zone_cap = g_zones[g_cur_zone].capacity / PAGE_SIZE;
+    bool need_finish = false;
+    uint32_t old_zone = g_cur_zone;
 
     if (g_zone_wp + (uint64_t)total > zone_cap)
     {
-        /* Finish partially used zone so it becomes FULL (not ACTIVE). */
-        if (g_zone_wp > 0 && g_zone_wp < zone_cap)
-        {
-            off_t zstart = (off_t)g_zones[g_cur_zone].start;
-            off_t zlen = (off_t)g_zones[g_cur_zone].len;
-            if (zbd_finish_zones(g_fd, zstart, zlen) != 0)
-            {
-                perror("zbd_finish_zones");
-                abort();
-            }
-        }
-
+        need_finish = (g_zone_wp > 0 && g_zone_wp < zone_cap);
         g_cur_zone++;
         if (g_cur_zone >= g_nzones)
         {
@@ -343,70 +428,149 @@ static pgn_t flush_tree(void)
         atomic_fetch_add_explicit(&g_metrics.zone_advance_count, 1, memory_order_relaxed);
     }
 
-    /* Pre-assign page numbers (post-order = children before parents) */
+    /* Pre-assign page numbers: post-order guarantees children < parents. */
     pgn_t base_pgn = (pgn_t)(g_zones[g_cur_zone].start / PAGE_SIZE + g_zone_wp);
     for (int i = 0; i < total; i++)
         pool[dfs_order[i]].pagenum = base_pgn + (pgn_t)i;
 
-    /* Build disk pages and batch-write */
-    int written = 0;
-    while (written < total)
-    {
-        int chunk = total - written;
-        if (chunk > MAX_APPEND_PAGES)
-            chunk = MAX_APPEND_PAGES;
-
-        for (int i = 0; i < chunk; i++)
-        {
-            nid_t nid = dfs_order[written + i];
-            ram_node *rn = &pool[nid];
-            disk_page *dp = (disk_page *)(g_wbuf + (size_t)i * PAGE_SIZE);
-            memset(dp, 0, PAGE_SIZE);
-            dp->is_leaf = rn->is_leaf;
-            dp->num_keys = rn->num_keys;
-            if (rn->is_leaf)
-            {
-                dp->pointer = PGN_NULL;
-                for (uint32_t k = 0; k < rn->num_keys; k++)
-                {
-                    dp->leaf[k].key = rn->keys[k];
-                    memcpy(dp->leaf[k].value, rn->values[k], 120);
-                }
-            }
-            else
-            {
-                for (uint32_t k = 0; k < rn->num_keys; k++)
-                {
-                    dp->internal[k].key = rn->keys[k];
-                    /* child pagenum is either new (dirty child, already assigned
-                     * above) or old (non-dirty child, valid from prev flush) */
-                    dp->internal[k].child = pool[rn->children[k]].pagenum;
-                }
-                dp->pointer = pool[rn->children[rn->num_keys]].pagenum;
-            }
-        }
-
-        pgn_t got __attribute__((unused));
-        uint64_t t_nvme = monotonic_ns();
-        if (zone_append_n(g_cur_zone, g_wbuf, chunk, &got) != 0)
-        {
-            fprintf(stderr, "flush: append failed\n");
-            abort();
-        }
-        atomic_fetch_add_explicit(&g_metrics.nvme_ns_total,
-                                  monotonic_ns() - t_nvme, memory_order_relaxed);
-        written += chunk;
-    }
+    /* Advance the software write pointer now so the next TX's phase1 sees
+     * the correct starting position even before NVMe writes complete. */
     g_zone_wp += (uint64_t)total;
 
+    batch->n_pages          = total;
+    batch->buf_slot         = buf_slot;
+    batch->zone_id          = g_cur_zone;
+    batch->needs_zone_finish = need_finish;
+    batch->old_zone_id      = old_zone;
+    /* batch->root_pgn is set by the last serializer */
+}
+
+/*
+ * committer_main — dedicated background thread that writes serialized pages
+ * to NVMe.  Receives commit_batch_t entries from g_cq_slots[] and performs
+ * zone_append_n() + write_superblock() while the next TX's workers are
+ * already inserting into the B-tree.
+ */
+static void *committer_main(void *arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        pthread_mutex_lock(&g_cq_lock);
+        while (g_cq_count == 0 && !g_cq_shutdown)
+            pthread_cond_wait(&g_cq_notempty, &g_cq_lock);
+        if (g_cq_count == 0) /* shutdown with empty queue */
+        {
+            pthread_mutex_unlock(&g_cq_lock);
+            break;
+        }
+        commit_batch_t batch = g_cq_slots[g_cq_head];
+        g_cq_head = (g_cq_head + 1) % COMMIT_Q_DEPTH;
+        g_cq_count--;
+        pthread_cond_signal(&g_cq_notfull);
+        pthread_mutex_unlock(&g_cq_lock);
+
+        if (batch.n_pages == 0)
+            continue;
+
+        uint64_t t_commit = monotonic_ns();
+
+        /* If this TX crossed a zone boundary, finish the old zone first. */
+        if (batch.needs_zone_finish)
+        {
+            off_t zstart = (off_t)g_zones[batch.old_zone_id].start;
+            off_t zlen   = (off_t)g_zones[batch.old_zone_id].len;
+            if (zbd_finish_zones(g_fd, zstart, zlen) != 0)
+            {
+                perror("zbd_finish_zones");
+                abort();
+            }
+        }
+
+        /* Write all pages in MAX_APPEND_PAGES-page chunks. */
+        uint8_t *buf = g_serial_bufs[batch.buf_slot];
+        int written = 0;
+        while (written < batch.n_pages)
+        {
+            int chunk = batch.n_pages - written;
+            if (chunk > MAX_APPEND_PAGES)
+                chunk = MAX_APPEND_PAGES;
+
+            pgn_t got __attribute__((unused));
+            uint64_t t_nvme = monotonic_ns();
+            if (zone_append_n(batch.zone_id, buf + (size_t)written * PAGE_SIZE,
+                              chunk, &got) != 0)
+            {
+                fprintf(stderr, "committer: append failed\n");
+                abort();
+            }
+            atomic_fetch_add_explicit(&g_metrics.nvme_ns_total,
+                                      monotonic_ns() - t_nvme, memory_order_relaxed);
+            written += chunk;
+        }
+
+        write_superblock(batch.root_pgn);
+
+        atomic_fetch_add_explicit(&g_metrics.commit_ns_total,
+                                  monotonic_ns() - t_commit, memory_order_relaxed);
+    }
+    return NULL;
+}
+
+/*
+ * flush_tree_sync — synchronous fallback used for the residual partial TX
+ * after all worker threads have exited.  Not on the hot path.
+ */
+static pgn_t flush_tree_sync(void)
+{
+    if (g_root == NID_NULL)
+        return PGN_NULL;
+
+    commit_batch_t batch;
+    flush_prepare_phase1(0, &batch); /* always use slot 0 */
+    if (batch.n_pages == 0)
+        return pool[g_root].pagenum;
+
+    /* Serialize all nodes into slot 0 */
+    for (int i = 0; i < batch.n_pages; i++)
+        build_disk_page(g_serial_bufs[0] + (size_t)i * PAGE_SIZE, dfs_order[i]);
+
     pgn_t root_pgn = pool[g_root].pagenum;
+    batch.root_pgn = root_pgn;
+
+    /* Inline NVMe write (synchronous) */
+    if (batch.needs_zone_finish)
+    {
+        off_t zstart = (off_t)g_zones[batch.old_zone_id].start;
+        off_t zlen   = (off_t)g_zones[batch.old_zone_id].len;
+        if (zbd_finish_zones(g_fd, zstart, zlen) != 0)
+        {
+            perror("zbd_finish_zones");
+            abort();
+        }
+    }
+
+    int written = 0;
+    while (written < batch.n_pages)
+    {
+        int chunk = batch.n_pages - written;
+        if (chunk > MAX_APPEND_PAGES)
+            chunk = MAX_APPEND_PAGES;
+        pgn_t got __attribute__((unused));
+        if (zone_append_n(batch.zone_id,
+                          g_serial_bufs[0] + (size_t)written * PAGE_SIZE,
+                          chunk, &got) != 0)
+        {
+            fprintf(stderr, "flush_tree_sync: append failed\n");
+            abort();
+        }
+        written += chunk;
+    }
     write_superblock(root_pgn);
 
-    /* Clear dirty flags */
-    for (int i = 0; i < total; i++)
+    for (int i = 0; i < batch.n_pages; i++)
         pool[dfs_order[i]].dirty = 0;
 
-    pthread_mutex_unlock(&g_dev_lock);
     return root_pgn;
 }
 
@@ -838,37 +1002,18 @@ restart:
 /* ─────────────────── TX worker ─────────────────── */
 
 /*
- * TX machine: `expected` workers join, each applies one insert,
- * last one to complete flushes. Epoch changes signal TX completion.
+ * tx_insert — hot path for every worker insert.
+ *
+ * Phase 1: join an open TX (wait if closed/flushing/serializing).
+ * Phase 2: parallel latch-crabbing insert.
+ * Phase 3: commit pipeline —
+ *   Closer (last done): runs flush_prepare_phase1 outside the lock (fast,
+ *     ~20µs), then broadcasts to switch the TX into SERIALIZING state.
+ *   All workers: atomically claim dirty nodes and call build_disk_page into
+ *     g_serial_bufs[slot] in parallel.
+ *   Last serializer: clears dirty flags, pushes batch to the async committer
+ *     thread, increments epoch → workers immediately start the next TX.
  */
-/* Helper: record TX flush metrics and reset TX state.  Called under g_tx.lock
- * with flushing=true already set.  Releases lock, runs flush, reacquires. */
-static void do_tx_flush(int joined_snap)
-{
-    pthread_mutex_unlock(&g_tx.lock);
-
-    uint64_t t_flush = monotonic_ns();
-    flush_tree();
-    uint64_t flush_ns = monotonic_ns() - t_flush;
-
-    pthread_mutex_lock(&g_tx.lock);
-    uint64_t epoch_before = g_tx.epoch;
-    (void)epoch_before;
-    g_tx.epoch++;
-    g_tx.joined = 0;
-    g_tx.done = 0;
-    g_tx.closed = false;
-    g_tx.closed_by_count = false;
-    g_tx.flushing = false;
-    pthread_cond_broadcast(&g_tx.cond);
-
-    /* Record metrics (after state reset; still under lock for closed_by_count read) */
-    atomic_fetch_add_explicit(&g_metrics.tx_count, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_metrics.tx_joined_sum, (uint64_t)joined_snap,
-                              memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_metrics.flush_ns_total, flush_ns, memory_order_relaxed);
-}
-
 static void tx_insert(int64_t key, const char *value)
 {
     /* ── Phase 1: wait to join an open TX ── */
@@ -876,7 +1021,7 @@ static void tx_insert(int64_t key, const char *value)
     pthread_mutex_lock(&g_tx.lock);
     for (;;)
     {
-        if (!g_tx.closed && !g_tx.flushing)
+        if (!g_tx.closed && !g_tx.flushing && !g_tx.serializing)
             break;
         pthread_cond_wait(&g_tx.cond, &g_tx.lock);
     }
@@ -901,7 +1046,7 @@ static void tx_insert(int64_t key, const char *value)
     atomic_fetch_add_explicit(&g_metrics.insert_ns_total,
                               monotonic_ns() - t0, memory_order_relaxed);
 
-    /* ── Phase 3: commit or wait for epoch change ── */
+    /* ── Phase 3: commit phase ── */
     t0 = monotonic_ns();
     pthread_mutex_lock(&g_tx.lock);
     g_tx.done++;
@@ -918,75 +1063,194 @@ static void tx_insert(int64_t key, const char *value)
         }
     }
 
-    bool do_flush = g_tx.closed && (g_tx.done == g_tx.joined) && !g_tx.flushing;
-
-    if (do_flush)
+    /* Helper lambda (as goto target) for the closer logic.
+     * Entered when: closed && done==joined && !flushing && !serializing. */
+    bool is_closer = g_tx.closed && (g_tx.done == g_tx.joined) &&
+                     !g_tx.flushing && !g_tx.serializing;
+    if (is_closer)
     {
-        int joined_snap = g_tx.joined;
-        bool by_count = g_tx.closed_by_count;
         g_tx.flushing = true;
-        do_tx_flush(joined_snap);
-        /* closed_by_count already incremented when TX was closed; but if it was
-         * closed by timeout in this phase, record it (already done above).
-         * For count-closed TXs we already incremented tx_closed_by_count above. */
-        (void)by_count;
+        int joined_snap = g_tx.joined;
         pthread_mutex_unlock(&g_tx.lock);
-    }
-    else
-    {
-        /*
-         * Wait for epoch change (another thread is or will be the flusher).
-         * Use timedwait so we self-rescue if all other threads have exited.
-         */
-        while (g_tx.epoch == my_epoch)
+
+        /* Wait for a free commit slot (outside g_tx.lock). */
+        uint64_t t_cw = monotonic_ns();
+        pthread_mutex_lock(&g_cq_lock);
+        while (g_cq_count >= COMMIT_Q_DEPTH)
+            pthread_cond_wait(&g_cq_notfull, &g_cq_lock);
+        int reserved_slot = g_cq_tail;
+        pthread_mutex_unlock(&g_cq_lock);
+        atomic_fetch_add_explicit(&g_metrics.commit_wait_ns_total,
+                                  monotonic_ns() - t_cw, memory_order_relaxed);
+
+        /* DFS + zone advance + pagenum assign (fast, no NVMe). */
+        commit_batch_t batch;
+        flush_prepare_phase1(reserved_slot, &batch);
+
+        pthread_mutex_lock(&g_tx.lock);
+        if (batch.n_pages > 0)
         {
+            g_cq_slots[reserved_slot] = batch;
+            atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
+            atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
+            g_tx.serial_total    = batch.n_pages;
+            g_tx.serial_buf_slot = reserved_slot;
+            g_tx.serializing     = true;
+            atomic_fetch_add_explicit(&g_metrics.tx_count, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_metrics.tx_joined_sum, (uint64_t)joined_snap,
+                                      memory_order_relaxed);
+        }
+        else
+        {
+            /* Nothing dirty: skip serialization, advance epoch directly. */
+            g_tx.epoch++;
+            g_tx.joined = 0; g_tx.done = 0;
+            g_tx.closed = false; g_tx.closed_by_count = false;
+            g_tx.flushing = false;
+            pthread_cond_broadcast(&g_tx.cond);
+            pthread_mutex_unlock(&g_tx.lock);
+            atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
+                                      monotonic_ns() - t0, memory_order_relaxed);
+            return;
+        }
+        pthread_cond_broadcast(&g_tx.cond); /* wake workers to serialize */
+    }
+
+    /* Serialization + epoch-wait loop */
+    while (g_tx.epoch == my_epoch)
+    {
+        if (g_tx.serializing)
+        {
+            int idx        = atomic_fetch_add_explicit(&g_tx.serial_claimed, 1,
+                                                       memory_order_relaxed);
+            int total      = g_tx.serial_total;
+            int slot       = g_tx.serial_buf_slot;
+            int joined_snap = g_tx.joined; /* stable: TX closed, no new joiners */
+
+            if (idx < total)
+            {
+                nid_t   nid = dfs_order[idx];
+                uint8_t *dst = g_serial_bufs[slot] + (size_t)idx * PAGE_SIZE;
+                pthread_mutex_unlock(&g_tx.lock);
+
+                uint64_t t_ser = monotonic_ns();
+                build_disk_page(dst, nid);
+                atomic_fetch_add_explicit(&g_metrics.serialize_ns_total,
+                                          monotonic_ns() - t_ser, memory_order_relaxed);
+
+                pthread_mutex_lock(&g_tx.lock);
+            }
+            /* Workers with idx >= total skip building but still count as done. */
+
+            int done = atomic_fetch_add_explicit(&g_tx.serial_done, 1,
+                                                 memory_order_relaxed) + 1;
+            if (done == joined_snap)
+            {
+                /* Last worker: clear dirty, push batch, advance epoch. */
+                for (int i = 0; i < total; i++)
+                    pool[dfs_order[i]].dirty = 0;
+
+                g_cq_slots[slot].root_pgn =
+                    (g_root != NID_NULL) ? pool[g_root].pagenum : PGN_NULL;
+
+                pthread_mutex_lock(&g_cq_lock);
+                g_cq_tail  = (g_cq_tail + 1) % COMMIT_Q_DEPTH;
+                g_cq_count++;
+                pthread_cond_signal(&g_cq_notempty);
+                pthread_mutex_unlock(&g_cq_lock);
+
+                g_tx.epoch++;
+                g_tx.joined = 0; g_tx.done = 0;
+                g_tx.closed = false; g_tx.closed_by_count = false;
+                g_tx.flushing = false; g_tx.serializing = false;
+                pthread_cond_broadcast(&g_tx.cond);
+                /* epoch changed; while condition exits */
+            }
+            else
+            {
+                /* Wait for last serializer to broadcast epoch++ */
+                pthread_cond_wait(&g_tx.cond, &g_tx.lock);
+            }
+        }
+        else
+        {
+            /* TX not yet closed or not all done: timedwait + timeout-closer. */
             uint64_t deadline_ns = g_tx.open_ns + TX_TIMEOUT_NS;
-            uint64_t now_ns = monotonic_ns();
+            uint64_t now_ns      = monotonic_ns();
             if (now_ns < deadline_ns)
             {
                 uint64_t wait_ns = deadline_ns - now_ns;
                 struct timespec ts;
                 clock_gettime(CLOCK_REALTIME, &ts);
-                ts.tv_sec += (time_t)(wait_ns / 1000000000ULL);
+                ts.tv_sec  += (time_t)(wait_ns / 1000000000ULL);
                 ts.tv_nsec += (long)(wait_ns % 1000000000ULL);
-                if (ts.tv_nsec >= 1000000000L)
-                {
-                    ts.tv_sec++;
-                    ts.tv_nsec -= 1000000000L;
-                }
+                if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
                 pthread_cond_timedwait(&g_tx.cond, &g_tx.lock, &ts);
             }
             else
             {
-                /* Become flusher if TX is still open and we're the last done */
-                if (!g_tx.closed && !g_tx.flushing && g_tx.done == g_tx.joined)
+                if (!g_tx.closed && !g_tx.flushing && !g_tx.serializing &&
+                    g_tx.done == g_tx.joined)
                 {
-                    int joined_snap = g_tx.joined;
-                    g_tx.closed = true;
+                    /* Self-rescue: become closer (end-of-benchmark edge case) */
+                    g_tx.closed          = true;
                     g_tx.closed_by_count = false;
-                    g_tx.flushing = true;
+                    g_tx.flushing        = true;
                     atomic_fetch_add_explicit(&g_metrics.tx_closed_by_timeout, 1,
                                               memory_order_relaxed);
-                    do_tx_flush(joined_snap);
-                    /* epoch was incremented; outer while-condition will exit */
+                    int joined_snap = g_tx.joined;
+                    pthread_mutex_unlock(&g_tx.lock);
+
+                    uint64_t t_cw = monotonic_ns();
+                    pthread_mutex_lock(&g_cq_lock);
+                    while (g_cq_count >= COMMIT_Q_DEPTH)
+                        pthread_cond_wait(&g_cq_notfull, &g_cq_lock);
+                    int reserved_slot = g_cq_tail;
+                    pthread_mutex_unlock(&g_cq_lock);
+                    atomic_fetch_add_explicit(&g_metrics.commit_wait_ns_total,
+                                              monotonic_ns() - t_cw, memory_order_relaxed);
+
+                    commit_batch_t batch;
+                    flush_prepare_phase1(reserved_slot, &batch);
+
+                    pthread_mutex_lock(&g_tx.lock);
+                    if (batch.n_pages > 0)
+                    {
+                        g_cq_slots[reserved_slot] = batch;
+                        atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
+                        atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
+                        g_tx.serial_total    = batch.n_pages;
+                        g_tx.serial_buf_slot = reserved_slot;
+                        g_tx.serializing     = true;
+                        atomic_fetch_add_explicit(&g_metrics.tx_count, 1, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&g_metrics.tx_joined_sum,
+                                                  (uint64_t)joined_snap, memory_order_relaxed);
+                    }
+                    else
+                    {
+                        g_tx.epoch++;
+                        g_tx.joined = 0; g_tx.done = 0;
+                        g_tx.closed = false; g_tx.closed_by_count = false;
+                        g_tx.flushing = false;
+                        pthread_cond_broadcast(&g_tx.cond);
+                        pthread_mutex_unlock(&g_tx.lock);
+                        atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
+                                                  monotonic_ns() - t0, memory_order_relaxed);
+                        return;
+                    }
+                    pthread_cond_broadcast(&g_tx.cond);
                 }
                 else
                 {
-                    /*
-                     * Someone else is the flusher (flushing=true or TX still has
-                     * pending inserts). Don't busy-loop past the deadline: wait
-                     * for the real flusher to broadcast when it finishes.
-                     * No timeout needed — the flusher WILL complete and broadcast.
-                     */
                     pthread_cond_wait(&g_tx.cond, &g_tx.lock);
                 }
-                /* No break: re-check while (g_tx.epoch == my_epoch) */
             }
         }
-        atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
-                                  monotonic_ns() - t0, memory_order_relaxed);
-        pthread_mutex_unlock(&g_tx.lock);
     }
+
+    atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
+                              monotonic_ns() - t0, memory_order_relaxed);
+    pthread_mutex_unlock(&g_tx.lock);
 }
 
 /* ─────────────────── Worker threads ─────────────────── */
@@ -1103,7 +1367,21 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     g_tx.closed = false;
     g_tx.closed_by_count = false;
     g_tx.flushing = false;
+    g_tx.serializing = false;
     g_tx.expected = num_threads;
+    atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
+    g_tx.serial_total    = 0;
+    g_tx.serial_buf_slot = 0;
+
+    /* Reset commit queue */
+    g_cq_head  = 0;
+    g_cq_tail  = 0;
+    g_cq_count = 0;
+    g_cq_shutdown = false;
+
+    /* Start committer thread */
+    pthread_create(&g_committer, NULL, committer_main, NULL);
 
     /* Reset per-run metrics */
     memset(&g_metrics, 0, sizeof g_metrics);
@@ -1153,19 +1431,27 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
 
-    /* Flush any remaining partial TX */
+    /* Flush any remaining partial TX synchronously (no committer thread needed) */
     pthread_mutex_lock(&g_tx.lock);
-    if (g_tx.joined > 0 && g_tx.done == g_tx.joined && !g_tx.flushing)
+    if (g_tx.joined > 0 && g_tx.done == g_tx.joined &&
+        !g_tx.flushing && !g_tx.serializing)
     {
         g_tx.flushing = true;
         pthread_mutex_unlock(&g_tx.lock);
-        flush_tree();
+        flush_tree_sync();
         pthread_mutex_lock(&g_tx.lock);
         g_tx.flushing = false;
-        g_tx.joined = 0;
-        g_tx.done = 0;
+        g_tx.joined   = 0;
+        g_tx.done     = 0;
     }
     pthread_mutex_unlock(&g_tx.lock);
+
+    /* Drain the commit queue and stop the committer thread */
+    pthread_mutex_lock(&g_cq_lock);
+    g_cq_shutdown = true;
+    pthread_cond_signal(&g_cq_notempty);
+    pthread_mutex_unlock(&g_cq_lock);
+    pthread_join(g_committer, NULL);
 
     double elapsed = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) * 1e-9;
     double tput = (double)num_keys / elapsed;
@@ -1180,8 +1466,11 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     uint64_t joined_sum = atomic_load_explicit(&g_metrics.tx_joined_sum, memory_order_relaxed);
     uint64_t by_count = atomic_load_explicit(&g_metrics.tx_closed_by_count, memory_order_relaxed);
     uint64_t by_timeout = atomic_load_explicit(&g_metrics.tx_closed_by_timeout, memory_order_relaxed);
-    uint64_t flush_ns = atomic_load_explicit(&g_metrics.flush_ns_total, memory_order_relaxed);
-    uint64_t nvme_ns = atomic_load_explicit(&g_metrics.nvme_ns_total, memory_order_relaxed);
+    uint64_t flush_ns    = atomic_load_explicit(&g_metrics.flush_ns_total,       memory_order_relaxed);
+    uint64_t commit_ns   = atomic_load_explicit(&g_metrics.commit_ns_total,      memory_order_relaxed);
+    uint64_t ser_ns      = atomic_load_explicit(&g_metrics.serialize_ns_total,   memory_order_relaxed);
+    uint64_t cw_ns       = atomic_load_explicit(&g_metrics.commit_wait_ns_total, memory_order_relaxed);
+    uint64_t nvme_ns     = atomic_load_explicit(&g_metrics.nvme_ns_total,        memory_order_relaxed);
     uint64_t ins_ns = atomic_load_explicit(&g_metrics.insert_ns_total, memory_order_relaxed);
     uint64_t entry_ns = atomic_load_explicit(&g_metrics.entry_wait_ns_total, memory_order_relaxed);
     uint64_t epoch_ns = atomic_load_explicit(&g_metrics.epoch_wait_ns_total, memory_order_relaxed);
@@ -1191,10 +1480,16 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
 
     double avg_joined = tx_n ? (double)joined_sum / tx_n : 0.0;
     double avg_dirty = tx_n ? (double)dirty_tot / tx_n : 0.0;
-    double avg_flush_ms = tx_n ? (double)flush_ns / tx_n / 1e6 : 0.0;
-    double total_flush_ms = (double)flush_ns / 1e6;
-    double total_nvme_ms = (double)nvme_ns / 1e6;
-    double nvme_pct = flush_ns ? (double)nvme_ns / flush_ns * 100.0 : 0.0;
+    double avg_flush_ms   = tx_n ? (double)flush_ns  / tx_n / 1e6 : 0.0;
+    double avg_commit_ms  = tx_n ? (double)commit_ns  / tx_n / 1e6 : 0.0;
+    double avg_ser_ms     = tx_n ? (double)ser_ns     / tx_n / 1e6 : 0.0;
+    double total_flush_ms = (double)flush_ns  / 1e6;
+    double total_commit_ms = (double)commit_ns / 1e6;
+    double total_ser_ms   = (double)ser_ns    / 1e6;
+    double total_cw_ms    = (double)cw_ns     / 1e6;
+    double total_nvme_ms  = (double)nvme_ns   / 1e6;
+    double nvme_pct = commit_ns ? (double)nvme_ns / commit_ns * 100.0 : 0.0;
+    (void)avg_flush_ms;
     double ins_s = (double)ins_ns / 1e9;
     double entry_s = (double)entry_ns / 1e9;
     double epoch_s = (double)epoch_ns / 1e9;
@@ -1208,13 +1503,17 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     printf("    avg threads/TX:       %.2f  (expected=%d)\n", avg_joined, num_threads);
     printf("    closed by count:      %lu  (%.1f%%)\n", (unsigned long)by_count, by_count_pct);
     printf("    closed by timeout:    %lu  (%.1f%%)\n", (unsigned long)by_timeout, by_timeout_pct);
-    printf("  [Flush]\n");
+    printf("  [Pipeline]\n");
     printf("    avg dirty nodes/TX:   %.1f\n", avg_dirty);
-    printf("    avg flush time:       %.3f ms\n", avg_flush_ms);
-    printf("    total flush time:     %.1f ms\n", total_flush_ms);
-    printf("    total NVMe I/O time:  %.1f ms  (%.1f%% of flush)\n",
+    printf("    avg serialize time:   %.3f ms  (all workers, summed)\n", avg_ser_ms);
+    printf("    avg commit time:      %.3f ms  (committer NVMe+SB, wall)\n", avg_commit_ms);
+    printf("    total serialize:      %.1f ms\n", total_ser_ms);
+    printf("    total commit:         %.1f ms\n", total_commit_ms);
+    printf("    total NVMe I/O:       %.1f ms  (%.1f%% of commit)\n",
            total_nvme_ms, nvme_pct);
+    printf("    commit_wait (closer): %.1f ms  (time waiting for free slot)\n", total_cw_ms);
     printf("    zone advances:        %lu\n", (unsigned long)zone_adv);
+    (void)total_flush_ms;
     printf("  [Thread time, summed across all threads]\n");
     printf("    tree_insert:          %.3f s\n", ins_s);
     printf("    waiting to join TX:   %.3f s\n", entry_s);
@@ -1287,6 +1586,11 @@ int main(int argc, char **argv)
     /* Init TX */
     pthread_mutex_init(&g_tx.lock, NULL);
     pthread_cond_init(&g_tx.cond, NULL);
+
+    /* Init commit queue */
+    pthread_mutex_init(&g_cq_lock, NULL);
+    pthread_cond_init(&g_cq_notempty, NULL);
+    pthread_cond_init(&g_cq_notfull, NULL);
 
     g_fd = -1;
 
