@@ -153,6 +153,25 @@ static pthread_mutex_t g_dev_lock;
 
 static _Atomic(uint64_t) g_pages_appended;
 
+/* ─────────────────── Per-run metrics ─────────────────── */
+typedef struct
+{
+    _Atomic uint64_t tx_count;            /* TXs actually flushed              */
+    _Atomic uint64_t tx_joined_sum;       /* sum of joined counts per TX        */
+    _Atomic uint64_t tx_closed_by_count;  /* TXs closed because joined==expected*/
+    _Atomic uint64_t tx_closed_by_timeout;/* TXs closed by timeout              */
+    _Atomic uint64_t flush_ns_total;      /* wall time inside flush_tree (flusher thread) */
+    _Atomic uint64_t nvme_ns_total;       /* wall time inside zone_append_n     */
+    _Atomic uint64_t insert_ns_total;     /* sum of tree_insert() times         */
+    _Atomic uint64_t entry_wait_ns_total; /* time waiting to join TX (phase 1)  */
+    _Atomic uint64_t epoch_wait_ns_total; /* time waiting for TX completion      */
+    _Atomic uint64_t dirty_nodes_total;   /* total dirty nodes flushed           */
+    _Atomic uint64_t zone_advance_count;  /* number of zone transitions          */
+    _Atomic uint64_t restart_count;       /* wrlock-mode restarts in tree_insert */
+} run_metrics_t;
+
+static run_metrics_t g_metrics;
+
 /* ─────────────────── TX machine ─────────────────── */
 typedef struct
 {
@@ -161,6 +180,7 @@ typedef struct
     int joined;
     int done;
     bool closed;
+    bool closed_by_count; /* true if closed because joined==expected */
     bool flushing;
     uint64_t open_ns;
     pthread_mutex_t lock;
@@ -205,11 +225,24 @@ static int zone_append_n(uint32_t zone_id, const void *buf, int n_pages,
         .ilbrt_u64 = 0,
     };
 
-    if (nvme_zns_append(&args) != 0)
+    int nret = nvme_zns_append(&args);
+    if (nret != 0)
     {
-        fprintf(stderr, "nvme_zns_append zone=%u zslba=%llu nlb=%u data_len=%u: %s\n",
+        fprintf(stderr, "nvme_zns_append zone=%u zslba=%llu nlb=%u data_len=%u: "
+                "ret=0x%x errno=%d(%s)\n"
+                "  [state at error] g_zone_wp=%lu  zone_cap=%lu  "
+                "capacity_raw=0x%llx  start_raw=0x%llx  len_raw=0x%llx  "
+                "lblock=%u  total_lb=%u\n",
                 zone_id, (unsigned long long)zslba, (unsigned)nlb,
-                (unsigned)(n_pages * PAGE_SIZE), strerror(errno));
+                (unsigned)(n_pages * PAGE_SIZE),
+                (unsigned)nret, errno, strerror(errno),
+                (unsigned long)g_zone_wp,
+                (unsigned long)(g_zones[zone_id].capacity / PAGE_SIZE),
+                (unsigned long long)g_zones[zone_id].capacity,
+                (unsigned long long)g_zones[zone_id].start,
+                (unsigned long long)g_zones[zone_id].len,
+                g_info.lblock_size,
+                total_lb);
         return -1;
     }
 
@@ -278,13 +311,28 @@ static pgn_t flush_tree(void)
         return pool[g_root].pagenum;
 
     int total = dfs_count;
+    atomic_fetch_add_explicit(&g_metrics.dirty_nodes_total, (uint64_t)total,
+                              memory_order_relaxed);
 
     pthread_mutex_lock(&g_dev_lock);
 
     /* Advance zone if needed */
     uint64_t zone_cap = g_zones[g_cur_zone].capacity / PAGE_SIZE;
+
     if (g_zone_wp + (uint64_t)total > zone_cap)
     {
+        /* Finish partially used zone so it becomes FULL (not ACTIVE). */
+        if (g_zone_wp > 0 && g_zone_wp < zone_cap)
+        {
+            off_t zstart = (off_t)g_zones[g_cur_zone].start;
+            off_t zlen = (off_t)g_zones[g_cur_zone].len;
+            if (zbd_finish_zones(g_fd, zstart, zlen) != 0)
+            {
+                perror("zbd_finish_zones");
+                abort();
+            }
+        }
+
         g_cur_zone++;
         if (g_cur_zone >= g_nzones)
         {
@@ -292,6 +340,7 @@ static pgn_t flush_tree(void)
             abort();
         }
         g_zone_wp = 0;
+        atomic_fetch_add_explicit(&g_metrics.zone_advance_count, 1, memory_order_relaxed);
     }
 
     /* Pre-assign page numbers (post-order = children before parents) */
@@ -338,11 +387,14 @@ static pgn_t flush_tree(void)
         }
 
         pgn_t got __attribute__((unused));
+        uint64_t t_nvme = monotonic_ns();
         if (zone_append_n(g_cur_zone, g_wbuf, chunk, &got) != 0)
         {
             fprintf(stderr, "flush: append failed\n");
             abort();
         }
+        atomic_fetch_add_explicit(&g_metrics.nvme_ns_total,
+                                  monotonic_ns() - t_nvme, memory_order_relaxed);
         written += chunk;
     }
     g_zone_wp += (uint64_t)total;
@@ -563,6 +615,8 @@ restart:
                  * subtree when a concurrent split happened in the lock gap. */
                 HS_UNLOCK_ALL();
                 wrlock_mode = true;
+                atomic_fetch_add_explicit(&g_metrics.restart_count, 1,
+                                          memory_order_relaxed);
                 goto restart;
             }
 
@@ -600,6 +654,7 @@ restart:
     {
         HS_UNLOCK_ALL();
         wrlock_mode = true;
+        atomic_fetch_add_explicit(&g_metrics.restart_count, 1, memory_order_relaxed);
         goto restart;
     }
 
@@ -786,66 +841,102 @@ restart:
  * TX machine: `expected` workers join, each applies one insert,
  * last one to complete flushes. Epoch changes signal TX completion.
  */
+/* Helper: record TX flush metrics and reset TX state.  Called under g_tx.lock
+ * with flushing=true already set.  Releases lock, runs flush, reacquires. */
+static void do_tx_flush(int joined_snap)
+{
+    pthread_mutex_unlock(&g_tx.lock);
+
+    uint64_t t_flush = monotonic_ns();
+    flush_tree();
+    uint64_t flush_ns = monotonic_ns() - t_flush;
+
+    pthread_mutex_lock(&g_tx.lock);
+    uint64_t epoch_before = g_tx.epoch;
+    (void)epoch_before;
+    g_tx.epoch++;
+    g_tx.joined = 0;
+    g_tx.done = 0;
+    g_tx.closed = false;
+    g_tx.closed_by_count = false;
+    g_tx.flushing = false;
+    pthread_cond_broadcast(&g_tx.cond);
+
+    /* Record metrics (after state reset; still under lock for closed_by_count read) */
+    atomic_fetch_add_explicit(&g_metrics.tx_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_metrics.tx_joined_sum, (uint64_t)joined_snap,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_metrics.flush_ns_total, flush_ns, memory_order_relaxed);
+}
+
 static void tx_insert(int64_t key, const char *value)
 {
+    /* ── Phase 1: wait to join an open TX ── */
+    uint64_t t0 = monotonic_ns();
     pthread_mutex_lock(&g_tx.lock);
-
-    /* Wait until there's room in an open (non-closed, non-flushing) TX */
     for (;;)
     {
         if (!g_tx.closed && !g_tx.flushing)
             break;
         pthread_cond_wait(&g_tx.cond, &g_tx.lock);
     }
+    atomic_fetch_add_explicit(&g_metrics.entry_wait_ns_total,
+                              monotonic_ns() - t0, memory_order_relaxed);
 
     uint64_t my_epoch = g_tx.epoch;
     g_tx.joined++;
     if (g_tx.joined == 1)
         g_tx.open_ns = monotonic_ns();
     if (g_tx.joined >= g_tx.expected)
+    {
         g_tx.closed = true;
-
+        g_tx.closed_by_count = true;
+        atomic_fetch_add_explicit(&g_metrics.tx_closed_by_count, 1, memory_order_relaxed);
+    }
     pthread_mutex_unlock(&g_tx.lock);
 
-    /* Parallel latch-crabbing insert */
+    /* ── Phase 2: parallel latch-crabbing insert ── */
+    t0 = monotonic_ns();
     tree_insert(key, value);
+    atomic_fetch_add_explicit(&g_metrics.insert_ns_total,
+                              monotonic_ns() - t0, memory_order_relaxed);
 
+    /* ── Phase 3: commit or wait for epoch change ── */
+    t0 = monotonic_ns();
     pthread_mutex_lock(&g_tx.lock);
     g_tx.done++;
 
-    /* Check close-by-timeout */
+    /* Close by timeout if we're the last done and TX still open */
     if (!g_tx.closed && g_tx.done == g_tx.joined)
     {
         if (monotonic_ns() - g_tx.open_ns >= TX_TIMEOUT_NS)
+        {
             g_tx.closed = true;
+            g_tx.closed_by_count = false;
+            atomic_fetch_add_explicit(&g_metrics.tx_closed_by_timeout, 1,
+                                      memory_order_relaxed);
+        }
     }
 
     bool do_flush = g_tx.closed && (g_tx.done == g_tx.joined) && !g_tx.flushing;
 
     if (do_flush)
     {
+        int joined_snap = g_tx.joined;
+        bool by_count = g_tx.closed_by_count;
         g_tx.flushing = true;
-        pthread_mutex_unlock(&g_tx.lock);
-
-        flush_tree();
-
-        pthread_mutex_lock(&g_tx.lock);
-        g_tx.epoch++;
-        g_tx.joined = 0;
-        g_tx.done = 0;
-        g_tx.closed = false;
-        g_tx.flushing = false;
-        pthread_cond_broadcast(&g_tx.cond);
+        do_tx_flush(joined_snap);
+        /* closed_by_count already incremented when TX was closed; but if it was
+         * closed by timeout in this phase, record it (already done above).
+         * For count-closed TXs we already incremented tx_closed_by_count above. */
+        (void)by_count;
         pthread_mutex_unlock(&g_tx.lock);
     }
     else
     {
         /*
-         * Wait for another thread to complete the TX (epoch change) or for
-         * the TX timeout to expire.  Using timedwait avoids a permanent hang
-         * when all other threads have already exhausted their keys: if nobody
-         * else joins this TX within TX_TIMEOUT_NS of its open time, this
-         * thread becomes the flusher itself.
+         * Wait for epoch change (another thread is or will be the flusher).
+         * Use timedwait so we self-rescue if all other threads have exited.
          */
         while (g_tx.epoch == my_epoch)
         {
@@ -866,26 +957,22 @@ static void tx_insert(int64_t key, const char *value)
             }
             else
             {
-                /* Timeout elapsed — become flusher if TX is still open */
+                /* Become flusher if TX is still open and we're the last done */
                 if (!g_tx.closed && !g_tx.flushing && g_tx.done == g_tx.joined)
                 {
+                    int joined_snap = g_tx.joined;
                     g_tx.closed = true;
+                    g_tx.closed_by_count = false;
                     g_tx.flushing = true;
-                    pthread_mutex_unlock(&g_tx.lock);
-
-                    flush_tree();
-
-                    pthread_mutex_lock(&g_tx.lock);
-                    g_tx.epoch++;
-                    g_tx.joined = 0;
-                    g_tx.done = 0;
-                    g_tx.closed = false;
-                    g_tx.flushing = false;
-                    pthread_cond_broadcast(&g_tx.cond);
+                    atomic_fetch_add_explicit(&g_metrics.tx_closed_by_timeout, 1,
+                                              memory_order_relaxed);
+                    do_tx_flush(joined_snap);
                 }
                 break;
             }
         }
+        atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
+                                  monotonic_ns() - t0, memory_order_relaxed);
         pthread_mutex_unlock(&g_tx.lock);
     }
 }
@@ -1002,8 +1089,12 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     g_tx.joined = 0;
     g_tx.done = 0;
     g_tx.closed = false;
+    g_tx.closed_by_count = false;
     g_tx.flushing = false;
     g_tx.expected = num_threads;
+
+    /* Reset per-run metrics */
+    memset(&g_metrics, 0, sizeof g_metrics);
 
     /* Shuffled keys */
     int64_t *all_keys = malloc((size_t)num_keys * sizeof(int64_t));
@@ -1071,6 +1162,54 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
 
     printf("  elapsed=%.3f s  throughput=%.0f ops/sec  pages_appended=%lu  nodes_used=%u\n",
            elapsed, tput, (unsigned long)pages, (unsigned)nodes);
+
+    /* ── Detailed metrics ── */
+    uint64_t tx_n       = atomic_load_explicit(&g_metrics.tx_count,             memory_order_relaxed);
+    uint64_t joined_sum = atomic_load_explicit(&g_metrics.tx_joined_sum,        memory_order_relaxed);
+    uint64_t by_count   = atomic_load_explicit(&g_metrics.tx_closed_by_count,   memory_order_relaxed);
+    uint64_t by_timeout = atomic_load_explicit(&g_metrics.tx_closed_by_timeout, memory_order_relaxed);
+    uint64_t flush_ns   = atomic_load_explicit(&g_metrics.flush_ns_total,       memory_order_relaxed);
+    uint64_t nvme_ns    = atomic_load_explicit(&g_metrics.nvme_ns_total,        memory_order_relaxed);
+    uint64_t ins_ns     = atomic_load_explicit(&g_metrics.insert_ns_total,      memory_order_relaxed);
+    uint64_t entry_ns   = atomic_load_explicit(&g_metrics.entry_wait_ns_total,  memory_order_relaxed);
+    uint64_t epoch_ns   = atomic_load_explicit(&g_metrics.epoch_wait_ns_total,  memory_order_relaxed);
+    uint64_t dirty_tot  = atomic_load_explicit(&g_metrics.dirty_nodes_total,    memory_order_relaxed);
+    uint64_t zone_adv   = atomic_load_explicit(&g_metrics.zone_advance_count,   memory_order_relaxed);
+    uint64_t restarts   = atomic_load_explicit(&g_metrics.restart_count,        memory_order_relaxed);
+
+    double avg_joined  = tx_n ? (double)joined_sum / tx_n : 0.0;
+    double avg_dirty   = tx_n ? (double)dirty_tot  / tx_n : 0.0;
+    double avg_flush_ms= tx_n ? (double)flush_ns / tx_n / 1e6 : 0.0;
+    double total_flush_ms = (double)flush_ns / 1e6;
+    double total_nvme_ms  = (double)nvme_ns  / 1e6;
+    double nvme_pct    = flush_ns ? (double)nvme_ns / flush_ns * 100.0 : 0.0;
+    double ins_s       = (double)ins_ns   / 1e9;
+    double entry_s     = (double)entry_ns / 1e9;
+    double epoch_s     = (double)epoch_ns / 1e9;
+    uint64_t closed_total = by_count + by_timeout;
+    double by_count_pct   = closed_total ? (double)by_count   / closed_total * 100.0 : 0.0;
+    double by_timeout_pct = closed_total ? (double)by_timeout / closed_total * 100.0 : 0.0;
+    double restarts_per   = num_keys ? (double)restarts / num_keys : 0.0;
+
+    printf("  [TX]\n");
+    printf("    total TXs:            %lu\n",      (unsigned long)tx_n);
+    printf("    avg threads/TX:       %.2f  (expected=%d)\n", avg_joined, num_threads);
+    printf("    closed by count:      %lu  (%.1f%%)\n", (unsigned long)by_count,   by_count_pct);
+    printf("    closed by timeout:    %lu  (%.1f%%)\n", (unsigned long)by_timeout, by_timeout_pct);
+    printf("  [Flush]\n");
+    printf("    avg dirty nodes/TX:   %.1f\n",   avg_dirty);
+    printf("    avg flush time:       %.3f ms\n", avg_flush_ms);
+    printf("    total flush time:     %.1f ms\n", total_flush_ms);
+    printf("    total NVMe I/O time:  %.1f ms  (%.1f%% of flush)\n",
+           total_nvme_ms, nvme_pct);
+    printf("    zone advances:        %lu\n",      (unsigned long)zone_adv);
+    printf("  [Thread time, summed across all threads]\n");
+    printf("    tree_insert:          %.3f s\n",   ins_s);
+    printf("    waiting to join TX:   %.3f s\n",   entry_s);
+    printf("    waiting for epoch:    %.3f s\n",   epoch_s);
+    printf("  [Contention]\n");
+    printf("    wrlock restarts:      %lu  (avg %.4f per insert)\n",
+           (unsigned long)restarts, restarts_per);
     fflush(stdout);
 
     free(all_keys);
