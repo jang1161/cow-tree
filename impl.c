@@ -30,7 +30,7 @@
 #define PAGE_SIZE 4096
 #define LEAF_ORDER 32      /* max 31 keys/leaf            */
 #define INTERNAL_ORDER 249 /* max 248 keys, 249 children  */
-#define MAX_APPEND_PAGES 128
+#define MAX_APPEND_PAGES 64
 #define TX_TIMEOUT_NS (500000ULL) /* 500 µs */
 #define META_ZONE 0
 #define DATA_ZONE_START 1
