@@ -138,6 +138,7 @@ int main(int argc, char *argv[])
 
     printf("Resetting ZNS device...\n");
     reset_device(dev_path);
+    sleep(1);
 
     all_keys = malloc(sizeof(*all_keys) * (size_t)total_keys);
     if (!all_keys) {

@@ -1,3 +1,13 @@
+/*
+gcc -O2 -Wall \
+  -DCOW_VARIANT_RAM_STAGE2 \
+  bench/bench_main.c \
+  src/variants/cow_ram_stage2.c \
+  -Iinclude/variants \
+  -o build/bin/cow-bench-ram_stage2 \
+  -lzbd -lnvme -pthread
+*/
+
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -883,7 +893,7 @@ static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t 
 
         if (path.depth >= MAX_HEIGHT)
         {
-            fprintf(stderr, "tree depth exceeded MAX_HEIGHT\n");
+            fprintf(stderr, "tree depth %d exceeded MAX_HEIGHT\n", path.depth);
             exit(EXIT_FAILURE);
         }
 
@@ -1133,13 +1143,15 @@ static int collect_dirty_nodes(overlay_state *ov, node_id_t id,
 
     if (n->dirty || child_changed || is_temp_id(n->id))
     {
+        if (*count >= max)
+        {
+            fprintf(stderr, "collect_dirty_nodes: exceeded MAX_BATCH_PAGES (%d)\n", max);
+            exit(EXIT_FAILURE);
+        }
         n->flushed = 1;
         n->flushed_pn = (pagenum_t)(*count); /* temp: will become base_pn + idx */
-        if (*count < max)
-        {
-            entries[*count].n = n;
-            (*count)++;
-        }
+        entries[*count].n = n;
+        (*count)++;
         return 1;
     }
     else
@@ -1209,9 +1221,19 @@ static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
         {
             uint32_t next = zone_next(t, zone_id);
             uint32_t expected = zone_id;
-            atomic_compare_exchange_weak_explicit(
-                &t->current_zone, &expected, next,
-                memory_order_acq_rel, memory_order_acquire);
+            if (atomic_compare_exchange_weak_explicit(
+                    &t->current_zone, &expected, next,
+                    memory_order_acq_rel, memory_order_acquire))
+            {
+                /* This thread rotates away from a full zone, ensure it's finished */
+                off_t zstart = (off_t)zone_id * (off_t)t->info.zone_size;
+                off_t zlen = (off_t)t->info.zone_size;
+                if (zbd_finish_zones(t->fd, zstart, zlen) != 0)
+                {
+                    perror("zbd_finish_zones");
+                    exit(EXIT_FAILURE);
+                }
+            }
             continue;
         }
 
@@ -1225,9 +1247,19 @@ static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
             atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
             uint32_t next = zone_next(t, zone_id);
             uint32_t expected = zone_id;
-            atomic_compare_exchange_weak_explicit(
-                &t->current_zone, &expected, next,
-                memory_order_acq_rel, memory_order_acquire);
+            if (atomic_compare_exchange_weak_explicit(
+                    &t->current_zone, &expected, next,
+                    memory_order_acq_rel, memory_order_acquire))
+            {
+                /* Only this thread rotates away, so finish the zone to avoid active zone limit */
+                off_t zstart = (off_t)zone_id * (off_t)t->info.zone_size;
+                off_t zlen = (off_t)t->info.zone_size;
+                if (zbd_finish_zones(t->fd, zstart, zlen) != 0)
+                {
+                    perror("zbd_finish_zones");
+                    exit(EXIT_FAILURE);
+                }
+            }
             atomic_fetch_add_explicit(&t->stat_zone_rotations, 1, memory_order_relaxed);
             continue;
         }
