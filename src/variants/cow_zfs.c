@@ -21,6 +21,9 @@
 #define TXG_COMMIT_MERGE_ITEMS 512
 #define FLUSH_INTERVAL_MS 10
 
+#define MAX_BATCH_PAGES 2048
+#define MAX_NVME_PAGES  64
+
 #define READ_CACHE_SLOTS 64
 #define GLOBAL_PAGE_CACHE_SLOTS 4096
 #define RAM_TABLE_INIT_CAP 65536
@@ -82,6 +85,11 @@ typedef struct
     pagenum_t pn;
     page *data;
 } ram_page_slot;
+
+typedef struct
+{
+    overlay_node *n;
+} batch_entry;
 
 typedef struct
 {
@@ -257,7 +265,7 @@ static int ram_table_lookup(cow_tree *t, pagenum_t pn, page *dst)
     }
 }
 
-static void ram_table_insert(cow_tree *t, pagenum_t pn, const page *src)
+void ram_table_insert(cow_tree *t, pagenum_t pn, const page *src)
 {
     pthread_mutex_lock(&t->ram_lock);
 
@@ -373,7 +381,7 @@ static int global_cache_lookup(pagenum_t pn, page *dst)
     return hit;
 }
 
-static void global_cache_insert(pagenum_t pn, const page *src)
+void global_cache_insert(pagenum_t pn, const page *src)
 {
     if (pthread_once(&g_page_cache_once, init_global_page_cache) != 0)
     {
@@ -588,7 +596,7 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
     global_cache_insert(pn, dst);
 }
 
-static int zone_append_raw_nolock(cow_tree *t, uint32_t zone_id, const void *buf,
+int zone_append_raw_nolock(cow_tree *t, uint32_t zone_id, const void *buf,
                                   pagenum_t *out_pn, uint64_t *out_wp_bytes)
 {
     __u64 zslba = t->zones[zone_id].start / t->info.lblock_size;
@@ -1322,6 +1330,275 @@ static pagenum_t flush_overlay_node(overlay_state *ov, node_id_t id)
     return n->flushed_pn;
 }
 
+/*
+ * Resolve a child node_id to its final on-disk pagenum.
+ */
+static pagenum_t resolve_node_pn(overlay_state *ov, node_id_t child_id)
+{
+    if (child_id == INVALID_PGN)
+        return INVALID_PGN;
+    int idx = overlay_find_idx(ov, child_id);
+    if (idx >= 0)
+        return ov->arr[idx].flushed_pn;
+    return (pagenum_t)child_id;
+}
+
+/*
+ * Phase 1: post-order DFS collecting every overlay node that needs writing.
+ */
+static int collect_dirty_nodes(overlay_state *ov, node_id_t id,
+                                batch_entry *entries, int *count, int max)
+{
+    if (id == INVALID_PGN)
+        return 0;
+
+    int idx = overlay_find_idx(ov, id);
+    if (idx < 0)
+        return 0;
+
+    overlay_node *n = &ov->arr[idx];
+    if (n->flushed)
+        return (n->flushed_pn != (pagenum_t)n->id || is_temp_id(n->id));
+
+    int child_changed = 0;
+
+    if (!n->node.is_leaf)
+    {
+        for (uint32_t i = 0; i < n->node.num_keys; i++)
+            child_changed |= collect_dirty_nodes(ov, n->node.internal[i].child,
+                                                  entries, count, max);
+        child_changed |= collect_dirty_nodes(ov, n->node.pointer, entries, count, max);
+    }
+
+    if (n->dirty || child_changed || is_temp_id(n->id))
+    {
+        if (*count >= max)
+        {
+            fprintf(stderr, "collect_dirty_nodes: exceeded MAX_BATCH_PAGES (%d)\n", max);
+            exit(EXIT_FAILURE);
+        }
+        n->flushed = 1;
+        n->flushed_pn = (pagenum_t)(*count);
+        entries[*count].n = n;
+        (*count)++;
+        return 1;
+    }
+    else
+    {
+        n->flushed = 1;
+        n->flushed_pn = (pagenum_t)n->id;
+        return 0;
+    }
+}
+
+/*
+ * Append N pages in a single NVMe ZNS append command.
+ */
+static int zone_append_n_pages(cow_tree *t, uint32_t zone_id, const void *buf,
+                               int n_pages, pagenum_t *out_pn, uint64_t *out_wp_bytes)
+{
+    uint32_t total_bytes = (uint32_t)n_pages * PAGE_SIZE;
+    __u16    nlb         = (__u16)((total_bytes / t->info.lblock_size) - 1);
+    __u64    zslba       = t->zones[zone_id].start / t->info.lblock_size;
+    __u64    result      = 0;
+
+    struct nvme_zns_append_args args = {
+        .zslba        = zslba,
+        .result       = &result,
+        .data         = (void *)buf,
+        .metadata     = NULL,
+        .args_size    = sizeof(args),
+        .fd           = t->fd,
+        .timeout      = 0,
+        .nsid         = t->nsid,
+        .ilbrt        = 0,
+        .data_len     = total_bytes,
+        .metadata_len = 0,
+        .nlb          = nlb,
+        .control      = 0,
+        .lbat         = 0,
+        .lbatm        = 0,
+        .ilbrt_u64    = 0,
+    };
+
+    if (nvme_zns_append(&args) != 0)
+        return -1;
+
+    if (out_wp_bytes)
+        *out_wp_bytes = (result + (__u64)nlb + 1) * t->info.lblock_size;
+    if (out_pn)
+        *out_pn = (pagenum_t)(result * t->info.lblock_size / PAGE_SIZE);
+
+    return 0;
+}
+
+/*
+ * Flush all dirty overlay nodes as a single (chunked) NVMe ZNS append.
+ */
+static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
+{
+    if (root_id == INVALID_PGN)
+        return INVALID_PGN;
+
+    cow_tree *t = ov->t;
+    batch_entry entries[MAX_BATCH_PAGES];
+    int count = 0;
+
+    collect_dirty_nodes(ov, root_id, entries, &count, MAX_BATCH_PAGES);
+
+    int root_idx = overlay_find_idx(ov, root_id);
+
+    if (count == 0)
+        return (root_idx >= 0) ? ov->arr[root_idx].flushed_pn : (pagenum_t)root_id;
+
+    /* Zone selection */
+    uint32_t zone_id;
+    uint64_t base_wp;
+
+    for (;;)
+    {
+        zone_id = reserve_writable_zone(t);
+
+        base_wp = atomic_load_explicit(&t->zone_wp_bytes[zone_id], memory_order_acquire);
+        uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
+        uint64_t needed   = (uint64_t)count * PAGE_SIZE;
+
+        if (base_wp + needed > zone_end)
+        {
+            atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
+            uint32_t expected = zone_id;
+            uint32_t next = zone_next(t, zone_id);
+            atomic_compare_exchange_weak_explicit(
+                &t->current_zone, &expected, next,
+                memory_order_acq_rel, memory_order_acquire);
+            continue;
+        }
+        break;
+    }
+
+    pagenum_t base_pn = (pagenum_t)(base_wp / PAGE_SIZE);
+
+    /* Update software WP */
+    uint64_t total_bytes = (uint64_t)count * PAGE_SIZE;
+    uint64_t old_wp = atomic_fetch_add_explicit(
+        &t->zone_wp_bytes[zone_id], total_bytes, memory_order_acq_rel);
+
+    uint64_t zone_end = t->zones[zone_id].start + t->zones[zone_id].capacity;
+    if (old_wp + total_bytes > zone_end)
+    {
+        fprintf(stderr, "batch flush: zone space check failed\n");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Assign pagenums */
+    for (int i = 0; i < count; i++)
+        entries[i].n->flushed_pn = base_pn + (pagenum_t)i;
+
+    /* Build page data */
+    void *buf;
+    if (posix_memalign(&buf, PAGE_SIZE, (size_t)count * PAGE_SIZE) != 0)
+    {
+        perror("posix_memalign batch flush");
+        exit(EXIT_FAILURE);
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        overlay_node *n = entries[i].n;
+        page out = n->node;
+        out.pn = base_pn + (pagenum_t)i;
+
+        if (!out.is_leaf)
+        {
+            for (uint32_t j = 0; j < out.num_keys; j++)
+                out.internal[j].child = resolve_node_pn(ov, out.internal[j].child);
+            out.pointer = resolve_node_pn(ov, out.pointer);
+        }
+
+        memcpy((char *)buf + (size_t)i * PAGE_SIZE, &out, sizeof(page));
+    }
+
+    /* Batched NVMe append */
+    uint64_t t0 = monotonic_ns();
+    int done = 0;
+    pagenum_t actual_base = 0;
+
+    while (done < count)
+    {
+        int chunk = count - done;
+        if (chunk > MAX_NVME_PAGES)
+            chunk = MAX_NVME_PAGES;
+
+        char    *chunk_buf = (char *)buf + (size_t)done * PAGE_SIZE;
+        uint64_t wp_bytes  = 0;
+        pagenum_t chunk_pn = 0;
+
+        if (zone_append_n_pages(t, zone_id, chunk_buf, chunk, &chunk_pn, &wp_bytes) != 0)
+        {
+            perror("zone_append_n_pages");
+            exit(EXIT_FAILURE);
+        }
+
+        if (done == 0)
+            actual_base = chunk_pn;
+
+        uint64_t cur_wp = atomic_load_explicit(&t->zone_wp_bytes[zone_id], memory_order_acquire);
+        while (wp_bytes > cur_wp &&
+               !atomic_compare_exchange_weak_explicit(
+                   &t->zone_wp_bytes[zone_id], &cur_wp, wp_bytes,
+                   memory_order_acq_rel, memory_order_acquire))
+        {
+        }
+
+        done += chunk;
+    }
+    uint64_t append_dt = monotonic_ns() - t0;
+
+    /* Correct if hardware placed pages differently */
+    if (actual_base != base_pn)
+    {
+        pagenum_t delta = actual_base - base_pn;
+        for (int i = 0; i < count; i++)
+        {
+            entries[i].n->flushed_pn += delta;
+            page *pg = (page *)((char *)buf + (size_t)i * PAGE_SIZE);
+            pg->pn += delta;
+        }
+    }
+
+    /* Insert into caches */
+    for (int i = 0; i < count; i++)
+    {
+        overlay_node *n  = entries[i].n;
+        page         *pg = (page *)((char *)buf + (size_t)i * PAGE_SIZE);
+        ram_table_insert(t, n->flushed_pn, pg);
+        global_cache_insert(n->flushed_pn, pg);
+    }
+
+    atomic_fetch_add_explicit(&t->stat_append_ns_sum, append_dt, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_append_ns_samples, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_page_appends, (uint64_t)count, memory_order_relaxed);
+
+    /* Check zone-full */
+    {
+        uint64_t cur_wp = atomic_load_explicit(&t->zone_wp_bytes[zone_id], memory_order_acquire);
+        uint64_t zone_end_chk = t->zones[zone_id].start + t->zones[zone_id].capacity;
+        if (cur_wp >= zone_end_chk)
+        {
+            atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
+            uint32_t expected = zone_id;
+            uint32_t next = zone_next(t, zone_id);
+            atomic_compare_exchange_weak_explicit(
+                &t->current_zone, &expected, next,
+                memory_order_acq_rel, memory_order_acquire);
+        }
+    }
+
+    free(buf);
+
+    return (root_idx >= 0) ? ov->arr[root_idx].flushed_pn : (pagenum_t)root_id;
+}
+
 static void stage2_enqueue_job(cow_tree *t, txg_batch_job *job)
 {
     pthread_mutex_lock(&t->stage2_lock);
@@ -1608,7 +1885,7 @@ static void *txg_commit_main(void *arg)
         stat_update_max(&t->stat_overlay_nodes_max, (uint64_t)ov.len);
 
         uint64_t flush_t0 = monotonic_ns();
-        pagenum_t new_root = (root_id == INVALID_PGN) ? INVALID_PGN : flush_overlay_node(&ov, root_id);
+        pagenum_t new_root = flush_overlay_batched(&ov, root_id);
         uint64_t flush_dt = monotonic_ns() - flush_t0;
         atomic_fetch_add_explicit(&t->stat_flush_ns_sum, flush_dt, memory_order_relaxed);
         atomic_fetch_add_explicit(&t->stat_flush_ns_samples, 1, memory_order_relaxed);
