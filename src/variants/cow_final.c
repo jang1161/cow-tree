@@ -128,7 +128,73 @@ static inline uint64_t overlay_hash_u64(uint64_t x)
 }
 
 /*
- * Global Cache: Per-slot fine-grained locking
+ * Thread-Local Read Cache: Tier 1 (no locking, per-thread)
+ */
+static pthread_key_t tl_cache_key;
+
+typedef struct
+{
+    tl_cache_entry slots[TL_CACHE_SLOTS];
+    int next_slot;
+} tl_cache;
+
+static void tl_cache_destructor(void *ptr)
+{
+    if (ptr)
+        free(ptr);
+}
+
+static tl_cache *tl_cache_get_or_create(void)
+{
+    tl_cache *cache = (tl_cache *)pthread_getspecific(tl_cache_key);
+    if (!cache)
+    {
+        cache = calloc(1, sizeof(*cache));
+        if (!cache)
+        {
+            perror("calloc tl_cache");
+            exit(EXIT_FAILURE);
+        }
+        cache->next_slot = 0;
+        if (pthread_setspecific(tl_cache_key, cache) != 0)
+        {
+            perror("pthread_setspecific tl_cache");
+            free(cache);
+            exit(EXIT_FAILURE);
+        }
+    }
+    return cache;
+}
+
+static int tl_cache_lookup(pagenum_t pn, page *dst)
+{
+    tl_cache *cache = tl_cache_get_or_create();
+
+    for (int i = 0; i < TL_CACHE_SLOTS; i++)
+    {
+        if (cache->slots[i].valid && cache->slots[i].pn == pn)
+        {
+            *dst = cache->slots[i].data;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void tl_cache_insert(pagenum_t pn, const page *src)
+{
+    tl_cache *cache = tl_cache_get_or_create();
+
+    /* Simple round-robin replacement */
+    cache->slots[cache->next_slot].valid = 1;
+    cache->slots[cache->next_slot].pn = pn;
+    cache->slots[cache->next_slot].data = *src;
+
+    cache->next_slot = (cache->next_slot + 1) % TL_CACHE_SLOTS;
+}
+
+/*
+ * Global Cache: Tier 2 (per-set fine-grained locking)
  */
 static void global_cache_init(cow_tree *t)
 {
@@ -228,21 +294,30 @@ static void global_cache_insert(cow_tree *t, pagenum_t pn, const page *src)
 }
 
 /*
- * Load page from Global Cache or disk (on-demand paging)
+ * Load page: Tier 1 (TL cache, no lock) → Tier 2 (Global cache) → Disk I/O
  */
 static void load_page(cow_tree *t, pagenum_t pn, page *dst)
 {
     off_t off = (off_t)pn * PAGE_SIZE;
 
-    /* Try global cache first */
-    if (global_cache_lookup(t, pn, dst))
+    /* Tier 1: Try thread-local cache (no locking) */
+    if (tl_cache_lookup(pn, dst))
     {
         atomic_fetch_add_explicit(&t->stat_cache_global_hit, 1, memory_order_relaxed);
         return;
     }
 
+    /* Tier 2: Try global cache (with per-set locks) */
+    if (global_cache_lookup(t, pn, dst))
+    {
+        atomic_fetch_add_explicit(&t->stat_cache_global_hit, 1, memory_order_relaxed);
+        /* Populate TL cache for faster next access */
+        tl_cache_insert(pn, dst);
+        return;
+    }
+
     /* Cache miss: read from disk */
-    uint64_t miss_count = atomic_fetch_add_explicit(&t->stat_cache_miss, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_cache_miss, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&t->stat_odirect_reads, 1, memory_order_relaxed);
 
     if (t->direct_fd >= 0)
@@ -272,7 +347,8 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
         }
     }
 
-    /* Insert into global cache for future hits */
+    /* Insert into both caches for future hits */
+    tl_cache_insert(pn, dst);
     global_cache_insert(t, pn, dst);
 }
 
@@ -404,8 +480,19 @@ static void activate_meta_zone(cow_tree *t, uint32_t zone_id, uint64_t version)
 static void load_superblock(cow_tree *t)
 {
     zone_header zh0, zh1;
-    int v0 = (pread(t->fd, &zh0, PAGE_SIZE, 0) == PAGE_SIZE) && (zh0.magic == ZH_MAGIC);
-    int v1 = (pread(t->fd, &zh1, PAGE_SIZE, (off_t)META_ZONE_1 * t->info.zone_size) == PAGE_SIZE) &&
+
+    /* Cross-check zone WP: if WP == zone start, the zone was just reset.
+     * ZNS reset moves the WP back to zone start but does NOT erase data,
+     * so pread() would return stale ZH_MAGIC from a prior run.
+     * Only trust pread if the zone actually has data written (WP > start). */
+    uint64_t zone0_wp = atomic_load_explicit(&t->zone_wp_bytes[META_ZONE_0], memory_order_acquire);
+    uint64_t zone1_wp = atomic_load_explicit(&t->zone_wp_bytes[META_ZONE_1], memory_order_acquire);
+
+    int v0 = (zone0_wp > t->zones[META_ZONE_0].start) &&
+             (pread(t->fd, &zh0, PAGE_SIZE, 0) == PAGE_SIZE) &&
+             (zh0.magic == ZH_MAGIC);
+    int v1 = (zone1_wp > t->zones[META_ZONE_1].start) &&
+             (pread(t->fd, &zh1, PAGE_SIZE, (off_t)META_ZONE_1 * t->info.zone_size) == PAGE_SIZE) &&
              (zh1.magic == ZH_MAGIC);
 
     superblock_entry sb0, sb1;
@@ -1440,8 +1527,21 @@ static insert_req *get_tls_insert_req(void)
     return req;
 }
 
+static void init_tl_cache_key_once(void)
+{
+    if (pthread_key_create(&tl_cache_key, tl_cache_destructor) != 0)
+    {
+        perror("pthread_key_create tl_cache");
+        exit(EXIT_FAILURE);
+    }
+}
+
 cow_tree *cow_open(const char *path)
 {
+    /* Initialize thread-local cache key once */
+    static pthread_once_t tl_cache_once = PTHREAD_ONCE_INIT;
+    pthread_once(&tl_cache_once, init_tl_cache_key_once);
+
     cow_tree *t = calloc(1, sizeof(*t));
     if (!t)
     {
@@ -1516,12 +1616,6 @@ cow_tree *cow_open(const char *path)
     global_cache_init(t);
     load_superblock(t);
 
-    /* DEBUG: Print loaded superblock state */
-    fprintf(stderr, "[SUPERBLOCK] root_pn=%lu, seq_no=%lu, version=%lu\n",
-            (unsigned long)t->durable_sb.root_pn,
-            (unsigned long)t->durable_sb.seq_no,
-            (unsigned long)t->version);
-
     uint32_t initial_zone = DATA_ZONE_START;
     for (uint32_t z = DATA_ZONE_START; z < t->info.nr_zones; z++)
     {
@@ -1585,36 +1679,14 @@ void cow_close(cow_tree *t)
     uint64_t cache_miss = atomic_load_explicit(&t->stat_cache_miss, memory_order_relaxed);
     uint64_t appends = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
 
-    /* Count cache statistics */
-    uint32_t sets_used = 0;
-    uint32_t total_valid_entries = 0;
-    for (size_t i = 0; i < CACHE_NUM_SETS; i++)
-    {
-        int set_has_valid = 0;
-        for (int j = 0; j < CACHE_WAYS; j++)
-        {
-            if (t->global_cache[i].ways[j].valid)
-            {
-                set_has_valid = 1;
-                total_valid_entries++;
-            }
-        }
-        if (set_has_valid)
-            sets_used++;
-    }
-
     fprintf(stderr,
             "\n[cow_final profile]\n"
-            " cache_global_hit=%llu cache_miss=%llu appends=%llu\n"
-            " page_appends=%llu\n"
-            " CACHE STATS: sets_used=%u/%u total_entries=%u/%u hit_rate=%.1f%%\n",
+            " cache_global_hit=%llu cache_miss=%llu hit_rate=%.1f%%\n"
+            " page_appends=%llu\n",
             (unsigned long long)cache_hit,
             (unsigned long long)cache_miss,
-            (unsigned long long)appends,
-            (unsigned long long)appends,
-            sets_used, CACHE_NUM_SETS,
-            total_valid_entries, CACHE_NUM_SETS * CACHE_WAYS,
-            (cache_hit + cache_miss > 0) ? 100.0 * cache_hit / (cache_hit + cache_miss) : 0.0);
+            (cache_hit + cache_miss > 0) ? 100.0 * cache_hit / (cache_hit + cache_miss) : 0.0,
+            (unsigned long long)appends);
 
     global_cache_destroy(t);
     free(t->zones);

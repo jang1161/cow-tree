@@ -7,7 +7,7 @@ BUILD_DIR := build
 BIN_DIR := $(BUILD_DIR)/bin
 BENCH_SRC := bench/bench_main.c
 
-VARIANTS := bt ram ram_async ram2 ram3 ram_stage2 v3 v3_multi_cache zfs
+VARIANTS := bt ram ram_async ram2 ram3 ram_stage2 v3 v3_multi_cache zfs final
 
 VAR_SRC_bt := src/variants/cow_bt.c
 VAR_HDR_bt := include/variants/cow_bt.h
@@ -52,7 +52,12 @@ VAR_DESC_v3_multi_cache := set-associative global cache
 VAR_SRC_zfs := src/variants/cow_zfs.c
 VAR_HDR_zfs := include/variants/cow_zfs.h
 VAR_DEF_zfs := COW_VARIANT_ZFS
-VAR_DESC_zfs := zfs-style txg pipeline
+VAR_DESC_zfs := zfs-style txg pipeline with batched flush
+
+VAR_SRC_final := src/variants/cow_final.c
+VAR_HDR_final := include/variants/cow_final.h
+VAR_DEF_final := COW_VARIANT_FINAL
+VAR_DESC_final := on-demand paging + batched flush + global cache
 
 DEFAULT_VARIANT ?= ram
 
@@ -110,6 +115,7 @@ compat: all
 	ln -sf $(BIN_DIR)/cow-bench-ram3 cow_test_ram3
 	ln -sf $(BIN_DIR)/cow-bench-ram_stage2 cow_test_ram_stage2
 	ln -sf $(BIN_DIR)/cow-bench-zfs cow_test_zfs
+	ln -sf $(BIN_DIR)/cow-bench-final cow_test_final
 
 .PHONY: clean
 clean:
@@ -117,4 +123,4 @@ clean:
 
 .PHONY: distclean
 distclean: clean
-	rm -f cow_test_bt cow_test_ram cow_test_ram_async cow_test_ram2 cow_test_ram3 cow_test_ram_stage2 cow_test_zfs
+	rm -f cow_test_bt cow_test_ram cow_test_ram_async cow_test_ram2 cow_test_ram3 cow_test_ram_stage2 cow_test_zfs cow_test_final
