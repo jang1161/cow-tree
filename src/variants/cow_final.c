@@ -619,6 +619,7 @@ static void *sb_flusher_thread(void *arg)
 
 static void publish_root_txg(cow_tree *t, pagenum_t new_root, uint64_t txg)
 {
+    (void)txg;
     uint64_t s = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
     if (s & 1ULL)
         s++;
@@ -1232,35 +1233,6 @@ static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
 
 /* [Queue and TXG processing] */
 
-static void stage2_enqueue_job(cow_tree *t, txg_batch_job *job)
-{
-    pthread_mutex_lock(&t->stage2_lock);
-    if (t->stage2_tail)
-        t->stage2_tail->next = job;
-    else
-        t->stage2_head = job;
-    t->stage2_tail = job;
-    pthread_cond_signal(&t->stage2_cv);
-    pthread_mutex_unlock(&t->stage2_lock);
-}
-
-static txg_batch_job *stage2_dequeue_job(cow_tree *t)
-{
-    pthread_mutex_lock(&t->stage2_lock);
-    while (t->stage2_head == NULL &&
-           !atomic_load_explicit(&t->stop_commit, memory_order_acquire))
-        pthread_cond_wait(&t->stage2_cv, &t->stage2_lock);
-    txg_batch_job *job = t->stage2_head;
-    if (job)
-    {
-        t->stage2_head = job->next;
-        if (t->stage2_head == NULL)
-            t->stage2_tail = NULL;
-    }
-    pthread_mutex_unlock(&t->stage2_lock);
-    return job;
-}
-
 static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
 {
     int n = 0;
@@ -1288,8 +1260,6 @@ static int pop_batch(cow_tree *t, insert_req **batch, int max_batch)
         req->next = NULL;
         batch[n++] = req;
     }
-
-    int drained = n;
 
     if (n < max_batch && !atomic_load_explicit(&t->stop_sync, memory_order_acquire))
     {
@@ -1385,7 +1355,6 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs, int f
     pthread_mutex_lock(&t->flush_lock);
 
     pagenum_t root;
-    uint64_t seq;
     for (;;)
     {
         uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
@@ -1394,10 +1363,7 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs, int f
         root = atomic_load_explicit(&t->volatile_sb.root_pn, memory_order_acquire);
         uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
         if (s1 == s2 && ((s2 & 1ULL) == 0))
-        {
-            seq = s2;
             break;
-        }
     }
 
     overlay_state ov;
@@ -1413,6 +1379,8 @@ static void process_txg_jobs(cow_tree *t, txg_batch_job **jobs, int njobs, int f
     atomic_fetch_add_explicit(&t->stat_apply_ns_samples, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&t->stat_overlay_nodes_sum, (uint64_t)ov.len, memory_order_relaxed);
     stat_update_max_u64(&t->stat_overlay_nodes_max, (uint64_t)ov.len);
+    atomic_fetch_add_explicit(&t->stat_batch_sz_sum, (uint64_t)merged_n, memory_order_relaxed);
+    atomic_fetch_add_explicit(&t->stat_batch_sz_samples, 1, memory_order_relaxed);
 
     uint64_t flush_t0 = monotonic_ns();
     pagenum_t new_root = flush_overlay_batched(&ov, root_id);
@@ -1491,13 +1459,6 @@ static void *txg_batch_main(void *arg)
     pthread_cond_broadcast(&t->stage2_cv);
     pthread_mutex_unlock(&t->stage2_lock);
 
-    return NULL;
-}
-
-static void *txg_commit_main(void *arg)
-{
-    cow_tree *t = (cow_tree *)arg;
-    (void)t;
     return NULL;
 }
 
@@ -1679,14 +1640,34 @@ void cow_close(cow_tree *t)
     uint64_t cache_miss = atomic_load_explicit(&t->stat_cache_miss, memory_order_relaxed);
     uint64_t appends = atomic_load_explicit(&t->stat_page_appends, memory_order_relaxed);
 
+    uint64_t batch_sz_sum = atomic_load_explicit(&t->stat_batch_sz_sum, memory_order_relaxed);
+    uint64_t batch_sz_samples = atomic_load_explicit(&t->stat_batch_sz_samples, memory_order_relaxed);
+    uint64_t overlay_nodes_sum = atomic_load_explicit(&t->stat_overlay_nodes_sum, memory_order_relaxed);
+    uint64_t overlay_nodes_max = atomic_load_explicit(&t->stat_overlay_nodes_max, memory_order_relaxed);
+    uint64_t flush_ns_sum = atomic_load_explicit(&t->stat_flush_ns_sum, memory_order_relaxed);
+    uint64_t flush_ns_samples = atomic_load_explicit(&t->stat_flush_ns_samples, memory_order_relaxed);
+
     fprintf(stderr,
             "\n[cow_final profile]\n"
             " cache_global_hit=%llu cache_miss=%llu hit_rate=%.1f%%\n"
-            " page_appends=%llu\n",
+            " page_appends=%llu\n"
+            " avg_batch_sz=%.1f (sum=%llu samples=%llu)\n"
+            " avg_dirty_nodes=%.1f max_dirty_nodes=%llu (sum=%llu samples=%llu)\n"
+            " avg_flush_time_us=%.1f (sum=%llu ns samples=%llu)\n",
             (unsigned long long)cache_hit,
             (unsigned long long)cache_miss,
             (cache_hit + cache_miss > 0) ? 100.0 * cache_hit / (cache_hit + cache_miss) : 0.0,
-            (unsigned long long)appends);
+            (unsigned long long)appends,
+            batch_sz_samples > 0 ? (double)batch_sz_sum / batch_sz_samples : 0.0,
+            (unsigned long long)batch_sz_sum,
+            (unsigned long long)batch_sz_samples,
+            flush_ns_samples > 0 ? (double)overlay_nodes_sum / flush_ns_samples : 0.0,
+            (unsigned long long)overlay_nodes_max,
+            (unsigned long long)overlay_nodes_sum,
+            (unsigned long long)flush_ns_samples,
+            flush_ns_samples > 0 ? (double)flush_ns_sum / flush_ns_samples / 1000.0 : 0.0,
+            (unsigned long long)flush_ns_sum,
+            (unsigned long long)flush_ns_samples);
 
     global_cache_destroy(t);
     free(t->zones);
@@ -1708,7 +1689,6 @@ void cow_close(cow_tree *t)
 record *cow_find(cow_tree *t, int64_t key)
 {
     pagenum_t root;
-    uint64_t seq;
     for (;;)
     {
         uint64_t s1 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
@@ -1717,10 +1697,7 @@ record *cow_find(cow_tree *t, int64_t key)
         root = atomic_load_explicit(&t->volatile_sb.root_pn, memory_order_acquire);
         uint64_t s2 = atomic_load_explicit(&t->volatile_sb.seq_no, memory_order_acquire);
         if (s1 == s2 && ((s2 & 1ULL) == 0))
-        {
-            seq = s2;
             break;
-        }
     }
 
     if (root == INVALID_PGN)
