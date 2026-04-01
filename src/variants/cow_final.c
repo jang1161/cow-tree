@@ -145,73 +145,7 @@ static inline uint64_t overlay_hash_u64(uint64_t x)
 }
 
 /*
- * Thread-Local Read Cache: Tier 1 (no locking, per-thread)
- */
-static pthread_key_t tl_cache_key;
-
-typedef struct
-{
-    tl_cache_entry slots[TL_CACHE_SLOTS];
-    int next_slot;
-} tl_cache;
-
-static void tl_cache_destructor(void *ptr)
-{
-    if (ptr)
-        free(ptr);
-}
-
-static tl_cache *tl_cache_get_or_create(void)
-{
-    tl_cache *cache = (tl_cache *)pthread_getspecific(tl_cache_key);
-    if (!cache)
-    {
-        cache = calloc(1, sizeof(*cache));
-        if (!cache)
-        {
-            perror("calloc tl_cache");
-            exit(EXIT_FAILURE);
-        }
-        cache->next_slot = 0;
-        if (pthread_setspecific(tl_cache_key, cache) != 0)
-        {
-            perror("pthread_setspecific tl_cache");
-            free(cache);
-            exit(EXIT_FAILURE);
-        }
-    }
-    return cache;
-}
-
-static int tl_cache_lookup(pagenum_t pn, page *dst)
-{
-    tl_cache *cache = tl_cache_get_or_create();
-
-    for (int i = 0; i < TL_CACHE_SLOTS; i++)
-    {
-        if (cache->slots[i].valid && cache->slots[i].pn == pn)
-        {
-            *dst = cache->slots[i].data;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static void tl_cache_insert(pagenum_t pn, const page *src)
-{
-    tl_cache *cache = tl_cache_get_or_create();
-
-    /* Simple round-robin replacement */
-    cache->slots[cache->next_slot].valid = 1;
-    cache->slots[cache->next_slot].pn = pn;
-    cache->slots[cache->next_slot].data = *src;
-
-    cache->next_slot = (cache->next_slot + 1) % TL_CACHE_SLOTS;
-}
-
-/*
- * Global Cache: Tier 2 (per-set fine-grained locking)
+ * Global Page Cache (per-set fine-grained locking)
  */
 static void global_cache_init(cow_tree *t)
 {
@@ -317,19 +251,10 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
 {
     off_t off = (off_t)pn * PAGE_SIZE;
 
-    /* Tier 1: Try thread-local cache (no locking) */
-    if (tl_cache_lookup(pn, dst))
-    {
-        atomic_fetch_add_explicit(&t->stat_cache_global_hit, 1, memory_order_relaxed);
-        return;
-    }
-
-    /* Tier 2: Try global cache (with per-set locks) */
+    /* Try global page cache */
     if (global_cache_lookup(t, pn, dst))
     {
         atomic_fetch_add_explicit(&t->stat_cache_global_hit, 1, memory_order_relaxed);
-        /* Populate TL cache for faster next access */
-        tl_cache_insert(pn, dst);
         return;
     }
 
@@ -364,8 +289,7 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
         }
     }
 
-    /* Insert into both caches for future hits */
-    tl_cache_insert(pn, dst);
+    /* Insert into global cache */
     global_cache_insert(t, pn, dst);
 }
 
@@ -1510,21 +1434,9 @@ static insert_req *get_tls_insert_req(void)
     return req;
 }
 
-static void init_tl_cache_key_once(void)
-{
-    if (pthread_key_create(&tl_cache_key, tl_cache_destructor) != 0)
-    {
-        perror("pthread_key_create tl_cache");
-        exit(EXIT_FAILURE);
-    }
-}
-
 cow_tree *cow_open(const char *path)
 {
     printf("CACHE_NUM_SETS: %d, CACHE_WAYS: %d \n", CACHE_NUM_SETS, CACHE_WAYS);
-    /* Initialize thread-local cache key once */
-    static pthread_once_t tl_cache_once = PTHREAD_ONCE_INIT;
-    pthread_once(&tl_cache_once, init_tl_cache_key_once);
 
     cow_tree *t = calloc(1, sizeof(*t));
     if (!t)

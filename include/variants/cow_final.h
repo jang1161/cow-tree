@@ -23,9 +23,6 @@
 #define CACHE_NUM_SETS (4096 * 4)
 #define CACHE_WAYS 4
 
-/* Thread-Local Read Cache: Tier 1 (no locks, per-thread) */
-#define TL_CACHE_SLOTS 64
-
 typedef uint64_t pagenum_t;
 #define INVALID_PGN ((pagenum_t) - 1)
 
@@ -60,13 +57,6 @@ typedef struct
         internal_entity internal[INTERNAL_ORDER - 1];
     };
 } page;
-
-typedef struct
-{
-    uint8_t valid;
-    pagenum_t pn;
-    page data;
-} tl_cache_entry;
 
 typedef struct
 {
@@ -178,6 +168,8 @@ typedef struct
 
     _Atomic(uint64_t) stat_batches;
     _Atomic(uint64_t) stat_batch_items;
+    _Atomic(uint64_t) stat_batch_sz_sum;
+    _Atomic(uint64_t) stat_batch_sz_samples;
 
     _Atomic(uint64_t) stat_sort_ns_sum;
     _Atomic(uint64_t) stat_sort_ns_samples;
