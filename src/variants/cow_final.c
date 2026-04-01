@@ -1674,23 +1674,17 @@ void cow_close(cow_tree *t)
             "\n[cow_final profile]\n"
             " cache_global_hit=%llu cache_miss=%llu hit_rate=%.1f%%\n"
             " page_appends=%llu\n"
-            " avg_batch_sz=%.1f (sum=%llu samples=%llu)\n"
-            " avg_dirty_nodes=%.1f max_dirty_nodes=%llu (sum=%llu samples=%llu)\n"
-            " avg_flush_time_us=%.1f (sum=%llu ns samples=%llu)\n",
+            " avg_batch_sz=%.1f\n"
+            " avg_dirty_nodes=%.1f max_dirty_nodes=%llu\n"
+            " avg_flush_time_us=%.1f\n",
             (unsigned long long)cache_hit,
             (unsigned long long)cache_miss,
             (cache_hit + cache_miss > 0) ? 100.0 * cache_hit / (cache_hit + cache_miss) : 0.0,
             (unsigned long long)appends,
             batch_sz_samples > 0 ? (double)batch_sz_sum / batch_sz_samples : 0.0,
-            (unsigned long long)batch_sz_sum,
-            (unsigned long long)batch_sz_samples,
             flush_ns_samples > 0 ? (double)overlay_nodes_sum / flush_ns_samples : 0.0,
             (unsigned long long)overlay_nodes_max,
-            (unsigned long long)overlay_nodes_sum,
-            (unsigned long long)flush_ns_samples,
-            flush_ns_samples > 0 ? (double)flush_ns_sum / flush_ns_samples / 1000.0 : 0.0,
-            (unsigned long long)flush_ns_sum,
-            (unsigned long long)flush_ns_samples);
+            flush_ns_samples > 0 ? (double)flush_ns_sum / flush_ns_samples / 1000.0 : 0.0);
 
     global_cache_destroy(t);
     free(t->zones);
