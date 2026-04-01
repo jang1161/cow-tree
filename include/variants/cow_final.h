@@ -20,8 +20,11 @@
 #define LEAF_ORDER 32
 #define INTERNAL_ORDER 249
 
-#define CACHE_NUM_SETS 4096 * 4
+#define CACHE_NUM_SETS (4096 * 4)
 #define CACHE_WAYS 4
+
+/* Thread-Local Read Cache: Tier 1 (no locks, per-thread) */
+#define TL_CACHE_SLOTS 64
 
 typedef uint64_t pagenum_t;
 #define INVALID_PGN ((pagenum_t) - 1)
@@ -57,6 +60,13 @@ typedef struct
         internal_entity internal[INTERNAL_ORDER - 1];
     };
 } page;
+
+typedef struct
+{
+    uint8_t valid;
+    pagenum_t pn;
+    page data;
+} tl_cache_entry;
 
 typedef struct
 {

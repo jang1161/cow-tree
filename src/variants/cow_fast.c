@@ -366,7 +366,8 @@ static uint32_t reserve_writable_zone(cow_tree *t)
         }
         if (cur >= t->info.nr_zones) {
             fprintf(stderr, "zones exhausted\n"); 
-            exit(EXIT_FAILURE); }
+            exit(EXIT_FAILURE); 
+        }
         if (atomic_load_explicit(&t->zone_full[cur], memory_order_acquire))
         {
             uint32_t expected = cur;
@@ -658,7 +659,7 @@ static void write_superblock_sync(cow_tree *t)
 {
     pthread_mutex_lock(&t->flush_lock);
     t->durable_sb.magic = SB_MAGIC;
-    if (t->meta_wp >= t->info.zone_size / PAGE_SIZE)
+    if (t->meta_wp >= t->zones[t->active_zone].capacity / PAGE_SIZE)
     {
         uint32_t new_zone = 1 - t->active_zone;
         activate_meta_zone(t, new_zone, t->version + 1);
