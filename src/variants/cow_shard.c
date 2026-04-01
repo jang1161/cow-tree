@@ -7,7 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "variants/cow_btrfs2.h"
+#include "cow_shard.h"
 
 #define MAX_HEIGHT 32
 #define RIGHTMOST_IDX UINT32_MAX

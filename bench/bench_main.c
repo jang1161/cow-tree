@@ -7,24 +7,22 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(COW_VARIANT_BT)
-#include "cow_bt.h"
-#elif defined(COW_VARIANT_RAM)
+#if defined(COW_VARIANT_RAM)
 #include "cow_ram.h"
 #elif defined(COW_VARIANT_RAM_ASYNC)
 #include "cow_ram_async.h"
 #elif defined(COW_VARIANT_RAM2)
 #include "cow_ram2.h"
-#elif defined(COW_VARIANT_RAM3)
-#include "cow_ram3.h"
+#elif defined(COW_VARIANT_SHARD)
+#include "cow_shard.h"
 #elif defined(COW_VARIANT_RAM_STAGE2)
-#include "cow_ram_stage2.h"
+#include "cow_stage2.h"
 #elif defined(COW_VARIANT_V3)
 #include "cow_v3.h"
 #elif defined(COW_VARIANT_V3_MULTI_CACHE)
 #include "cow_v3_multi_cache.h"
-#elif defined(COW_VARIANT_ZFS)
-#include "cow_zfs.h"
+#elif defined(COW_VARIANT_FINAL)
+#include "cow_final.h"
 #else
 #include "cow_ram.h"
 #endif

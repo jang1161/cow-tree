@@ -67,17 +67,6 @@ typedef struct tx_commit_ctx
     uint64_t epoch;
 } tx_commit_ctx;
 
-typedef struct
-{
-    node_id_t id;
-    uint32_t cidx;
-} overlay_path_entry;
-
-typedef struct
-{
-    overlay_path_entry e[MAX_HEIGHT];
-    int depth;
-} overlay_path;
 
 static pthread_key_t direct_read_buf_key;
 static pthread_once_t direct_read_buf_key_once = PTHREAD_ONCE_INIT;
@@ -719,7 +708,7 @@ static void write_superblock_sync(cow_tree *t)
 
     t->durable_sb.magic = SB_MAGIC;
 
-    if (t->meta_wp >= t->info.zone_size / PAGE_SIZE)
+    if (t->meta_wp >= t->zones[t->active_zone].capacity / PAGE_SIZE)
     {
         uint32_t new_zone = 1 - t->active_zone;
         activate_meta_zone(t, new_zone, t->version + 1);
@@ -1173,266 +1162,316 @@ static uint32_t get_position(page *p, int64_t key)
     return p->num_keys;
 }
 
-static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id, int64_t key, const char *value)
+/*
+ * apply_insert_overlay — latch-crabbing concurrent B-tree insert.
+ *
+ * Lock protocol (top-down, write-mode):
+ *   1. Acquire root_lock + root's stripe lock together (root_lock acts as the
+ *      virtual "parent" lock for the root node, preventing concurrent root splits
+ *      from racing between our root-id read and our root lock acquisition).
+ *   2. Descend: at each internal node acquire the child's stripe lock, then —
+ *      if the current node is SAFE (num_keys < INTERNAL_ORDER-1, won't split) —
+ *      release all ancestors above it (they can't be affected by this insert).
+ *   3. At the leaf: insert / split inline (all unsafe ancestors still locked).
+ *   4. Propagate splits upward through the locked ancestor stack (no stale path).
+ *   5. Root split: root_lock is still held (because root was unsafe); update
+ *      *root_id atomically under root_lock.
+ *
+ * Same-stripe dedup: hs[] (held-lock set) prevents double-lock / double-unlock
+ * when two nodes hash to the same stripe mutex.
+ */
+static void apply_insert_overlay(overlay_state *ov, node_id_t *root_id,
+                                  int64_t key, const char *value)
 {
+    /* ---- held-lock set: distinct stripe mutex ptrs currently owned ---- */
+#define HS_MAX (MAX_HEIGHT + 4)
+    pthread_mutex_t *hs[HS_MAX];
+    int hs_n = 0;
 
-    pthread_mutex_lock(&ov->root_lock);
+    /* Acquire lk if not already held */
+#define HS_LOCK(lk) do {                                        \
+        bool _f = false;                                        \
+        for (int _i = 0; _i < hs_n; _i++)                      \
+            if (hs[_i] == (lk)) { _f = true; break; }          \
+        if (!_f) { pthread_mutex_lock(lk); hs[hs_n++] = (lk); }\
+    } while (0)
+
+    /* Release lk (remove from set; no-op if not held) */
+#define HS_UNLOCK(lk) do {                                      \
+        for (int _i = 0; _i < hs_n; _i++) {                    \
+            if (hs[_i] == (lk)) {                               \
+                hs[_i] = hs[--hs_n];                            \
+                pthread_mutex_unlock(lk);                        \
+                break;                                           \
+            }                                                    \
+        }                                                        \
+    } while (0)
+
+    /* Release all held locks at once */
+#define HS_UNLOCK_ALL() do {                                    \
+        for (int _i = 0; _i < hs_n; _i++)                      \
+            pthread_mutex_unlock(hs[_i]);                        \
+        hs_n = 0;                                               \
+    } while (0)
+
+    /* Release all except 'keep' (safe-node ancestor pruning) */
+#define HS_RELEASE_EXCEPT(keep) do {                            \
+        int _new = 0;                                           \
+        for (int _i = 0; _i < hs_n; _i++) {                    \
+            if (hs[_i] != (keep)) pthread_mutex_unlock(hs[_i]);\
+            else hs[_new++] = hs[_i];                           \
+        }                                                        \
+        hs_n = _new;                                            \
+    } while (0)
+
+    /* ---- Phase 0: empty tree ---- */
+    HS_LOCK(&ov->root_lock);   /* root_lock enters the held set */
 
     if (*root_id == INVALID_PGN)
     {
-
         node_id_t rid = overlay_new_temp(ov, 1);
-
         overlay_node *r = overlay_get_mut(ov, rid);
-
         r->node.num_keys = 1;
         r->node.pointer = INVALID_PGN;
         r->node.leaf[0].key = (uint64_t)key;
         memcpy(r->node.leaf[0].record.value, value, 120);
         r->dirty = 1;
         *root_id = rid;
-        pthread_mutex_unlock(&ov->root_lock);
-        return;
+        HS_UNLOCK_ALL();
+        goto latch_done;
     }
-    node_id_t cur_root = *root_id;
-    pthread_mutex_unlock(&ov->root_lock);
 
-    overlay_path path;
-    path.depth = 0;
-
-    node_id_t cur = cur_root;
-    pthread_mutex_t *held_lock = NULL;
-
-    while (1)
     {
-        pthread_mutex_t *cur_lock = overlay_node_lock(ov, cur);
-        if (held_lock != cur_lock)
-        {
-            if (held_lock)
-                pthread_mutex_unlock(held_lock);
-            pthread_mutex_lock(cur_lock);
-            held_lock = cur_lock;
-        }
+        node_id_t cur_root = *root_id;
 
-        overlay_node *n = overlay_get_mut(ov, cur);
+        /* Lock the root's stripe BEFORE releasing root_lock: this prevents a
+         * concurrent root-split from changing *root_id between our read and
+         * our acquisition of the root's stripe lock.                          */
+        HS_LOCK(overlay_node_lock(ov, cur_root));
+        /* root_lock stays in hs[] — it is the "parent lock" for the root.
+         * It will be released as soon as the root is found to be safe.        */
 
-        if (!n)
-        {
-            pthread_mutex_unlock(cur_lock);
-            exit(EXIT_FAILURE);
-        }
+        /* ---- ancestor stack (node_id + child-index, NOT a lock) ---- */
+        typedef struct { node_id_t id; uint32_t cidx; } anc_t;
+        anc_t anc[MAX_HEIGHT];
+        int   anc_n = 0;
 
-        if (n->node.is_leaf)
-        {
-            break;
-        }
+        node_id_t cur = cur_root;
 
-        if (path.depth >= MAX_HEIGHT)
+        /* ---- Phase 1: top-down latch-crabbing descent ---- */
+        for (;;)
         {
-            exit(EXIT_FAILURE);
-        }
+            overlay_node *n = overlay_get_mut(ov, cur);
+            if (!n) { HS_UNLOCK_ALL(); goto latch_done; }
 
-        uint32_t idx = RIGHTMOST_IDX;
-        for (uint32_t i = 0; i < n->node.num_keys; i++)
-        {
-            if (key < (int64_t)n->node.internal[i].key)
-            {
-                idx = i;
+            if (n->node.is_leaf)
                 break;
+
+            /* Safe-node check: if this internal node has room (won't split),
+             * release all ancestor locks above it — they are no longer at risk.
+             * Keep only cur's stripe lock (it might still split a child).      */
+            if (n->node.num_keys < INTERNAL_ORDER - 1)
+            {
+                HS_RELEASE_EXCEPT(overlay_node_lock(ov, cur));
+                anc_n = 0;   /* cleared: all previously recorded ancestors freed */
+            }
+
+            /* Descend to appropriate child */
+            uint32_t cidx = RIGHTMOST_IDX;
+            for (uint32_t i = 0; i < n->node.num_keys; i++)
+            {
+                if (key < (int64_t)n->node.internal[i].key) { cidx = i; break; }
+            }
+            node_id_t child = (cidx == RIGHTMOST_IDX)
+                              ? n->node.pointer
+                              : n->node.internal[cidx].child;
+
+            if (anc_n >= MAX_HEIGHT) { HS_UNLOCK_ALL(); goto latch_done; }
+            anc[anc_n].id   = cur;
+            anc[anc_n].cidx = cidx;
+            anc_n++;
+
+            HS_LOCK(overlay_node_lock(ov, child));   /* dedup handles same stripe */
+            cur = child;
+        }
+
+        /* ---- Phase 2: leaf insert / split ---- */
+        overlay_node *leaf_n = overlay_get_mut(ov, cur);
+        page *leaf = &leaf_n->node;
+
+        /* duplicate key */
+        for (uint32_t i = 0; i < leaf->num_keys; i++)
+        {
+            if ((int64_t)leaf->leaf[i].key == key)
+            {
+                memcpy(leaf->leaf[i].record.value, value, 120);
+                leaf_n->dirty = 1;
+                HS_UNLOCK_ALL();
+                goto latch_done;
             }
         }
 
-        path.e[path.depth].id = cur;
-        path.e[path.depth].cidx = idx;
-        path.depth++;
+        node_id_t carry_left  = cur;
+        node_id_t carry_right = INVALID_PGN;
+        int       carry_split = 0;
+        int64_t   carry_key   = 0;
 
-        node_id_t next = (idx == RIGHTMOST_IDX) ? n->node.pointer : n->node.internal[idx].child;
-        cur = next;
-    }
-
-    overlay_node *leaf_n = overlay_get_mut(ov, cur);
-    page *leaf = &leaf_n->node;
-
-    for (uint32_t i = 0; i < leaf->num_keys; i++)
-    {
-        if ((int64_t)leaf->leaf[i].key == key)
+        if (leaf->num_keys < LEAF_ORDER - 1)
         {
-            memcpy(leaf->leaf[i].record.value, value, 120);
+            uint32_t pos = get_position(leaf, key);
+            for (int64_t i = (int64_t)leaf->num_keys - 1; i >= (int64_t)pos; i--)
+                leaf->leaf[i + 1] = leaf->leaf[i];
+            leaf->leaf[pos].key = (uint64_t)key;
+            memcpy(leaf->leaf[pos].record.value, value, 120);
+            leaf->num_keys++;
             leaf_n->dirty = 1;
-            if (held_lock)
-                pthread_mutex_unlock(held_lock);
-            return;
         }
-    }
-
-    node_id_t carry_left = cur;
-    node_id_t carry_right = INVALID_PGN;
-    int carry_split = 0;
-    int64_t carry_key = 0;
-
-    if (leaf->num_keys < LEAF_ORDER - 1)
-    {
-        uint32_t pos = get_position(leaf, key);
-        for (int64_t i = (int64_t)leaf->num_keys - 1; i >= (int64_t)pos; i--)
-        {
-            leaf->leaf[i + 1] = leaf->leaf[i];
-        }
-        leaf->leaf[pos].key = (uint64_t)key;
-        memcpy(leaf->leaf[pos].record.value, value, 120);
-        leaf->num_keys++;
-        leaf_n->dirty = 1;
-        carry_split = 0;
-    }
-    else
-    {
-        leaf_entity tmp[LEAF_ORDER];
-        uint32_t pos = 0;
-        while (pos < leaf->num_keys && (int64_t)leaf->leaf[pos].key < key)
-            pos++;
-
-        for (uint32_t i = 0; i < pos; i++)
-            tmp[i] = leaf->leaf[i];
-        for (uint32_t i = pos; i < leaf->num_keys; i++)
-            tmp[i + 1] = leaf->leaf[i];
-
-        tmp[pos].key = (uint64_t)key;
-        memcpy(tmp[pos].record.value, value, 120);
-
-        uint32_t sp = LEAF_ORDER / 2;
-        for (uint32_t i = 0; i < sp; i++)
-            leaf->leaf[i] = tmp[i];
-        leaf->num_keys = sp;
-
-        node_id_t right_id = overlay_new_temp(ov, 1);
-        overlay_node *right_n = overlay_get_mut(ov, right_id);
-        right_n->node.num_keys = LEAF_ORDER - sp;
-        for (uint32_t i = 0; i < LEAF_ORDER - sp; i++)
-        {
-            right_n->node.leaf[i] = tmp[sp + i];
-        }
-        right_n->node.pointer = leaf->pointer;
-
-        leaf->pointer = right_id;
-        leaf_n->dirty = 1;
-        right_n->dirty = 1;
-
-        carry_split = 1;
-        carry_right = right_id;
-        carry_key = (int64_t)right_n->node.leaf[0].key;
-    }
-
-    if (held_lock)
-        pthread_mutex_unlock(held_lock);
-
-    while (path.depth > 0)
-    {
-        overlay_path_entry pe = path.e[--path.depth];
-        pthread_mutex_t *par_lock = overlay_node_lock(ov, pe.id);
-        pthread_mutex_lock(par_lock);
-        overlay_node *par_n = overlay_get_mut(ov, pe.id);
-        page *par = &par_n->node;
-
-        uint32_t cidx = pe.cidx;
-        uint32_t pos = (cidx == RIGHTMOST_IDX) ? par->num_keys : cidx;
-
-        if (cidx == RIGHTMOST_IDX)
-            par->pointer = carry_left;
         else
-            par->internal[cidx].child = carry_left;
+        {
+            leaf_entity tmp[LEAF_ORDER];
+            uint32_t pos = 0;
+            while (pos < leaf->num_keys && (int64_t)leaf->leaf[pos].key < key)
+                pos++;
+            for (uint32_t i = 0; i < pos;              i++) tmp[i]     = leaf->leaf[i];
+            for (uint32_t i = pos; i < leaf->num_keys;  i++) tmp[i + 1] = leaf->leaf[i];
+            tmp[pos].key = (uint64_t)key;
+            memcpy(tmp[pos].record.value, value, 120);
+
+            uint32_t sp = LEAF_ORDER / 2;
+            for (uint32_t i = 0; i < sp; i++) leaf->leaf[i] = tmp[i];
+            leaf->num_keys = sp;
+
+            node_id_t right_id    = overlay_new_temp(ov, 1);
+            overlay_node *right_n = overlay_get_mut(ov, right_id);
+            right_n->node.num_keys = LEAF_ORDER - sp;
+            for (uint32_t i = 0; i < LEAF_ORDER - sp; i++)
+                right_n->node.leaf[i] = tmp[sp + i];
+            right_n->node.pointer = leaf->pointer;
+            leaf->pointer         = right_id;
+            leaf_n->dirty         = right_n->dirty = 1;
+
+            carry_split = 1;
+            carry_right = right_id;
+            carry_key   = (int64_t)right_n->node.leaf[0].key;
+        }
 
         if (!carry_split)
         {
-            par_n->dirty = 1;
-            carry_left = pe.id;
-            pthread_mutex_unlock(par_lock);
-            continue;
+            HS_UNLOCK_ALL();
+            goto latch_done;
         }
 
-        if (par->num_keys < INTERNAL_ORDER - 1)
+        /* Leaf split: release leaf's stripe lock if safe to do so.
+         * HS_UNLOCK handles same-stripe correctly (no-op if parent shares it). */
+        HS_UNLOCK(overlay_node_lock(ov, cur));
+
+        /* ---- Phase 3: propagate splits up through LOCKED ancestor stack ----
+         * Unlike the old code, every ancestor here was locked during descent
+         * and has NOT been modified by any concurrent thread.                  */
+        for (int i = anc_n - 1; i >= 0; i--)
         {
-            for (int64_t j = (int64_t)par->num_keys - 1; j >= (int64_t)pos; j--)
+            node_id_t par_id = anc[i].id;
+            uint32_t  cidx   = anc[i].cidx;
+
+            overlay_node *par_n = overlay_get_mut(ov, par_id);
+            page *par = &par_n->node;
+            uint32_t pos = (cidx == RIGHTMOST_IDX) ? par->num_keys : cidx;
+
+            /* Update child pointer for the carry-left result */
+            if (cidx == RIGHTMOST_IDX)    par->pointer              = carry_left;
+            else                           par->internal[cidx].child  = carry_left;
+
+            if (par->num_keys < INTERNAL_ORDER - 1)
             {
-                par->internal[j + 1] = par->internal[j];
+                /* Parent has room — insert separator, no further split */
+                for (int64_t j = (int64_t)par->num_keys - 1; j >= (int64_t)pos; j--)
+                    par->internal[j + 1] = par->internal[j];
+                par->internal[pos].key   = (uint64_t)carry_key;
+                par->internal[pos].child = carry_left;
+                if (pos == (uint32_t)par->num_keys) par->pointer              = carry_right;
+                else                                 par->internal[pos + 1].child = carry_right;
+                par->num_keys++;
+                par_n->dirty = 1;
+                HS_UNLOCK_ALL();
+                goto latch_done;
             }
 
-            par->internal[pos].key = (uint64_t)carry_key;
-            par->internal[pos].child = carry_left;
+            /* Parent must split */
+            int64_t   tkeys[INTERNAL_ORDER];
+            node_id_t tchld[INTERNAL_ORDER + 1];
 
-            if (pos == par->num_keys)
-                par->pointer = carry_right;
-            else
-                par->internal[pos + 1].child = carry_right;
+            for (uint32_t j = 0; j < pos; j++)
+                tkeys[j] = (int64_t)par->internal[j].key;
+            tkeys[pos] = carry_key;
+            for (uint32_t j = pos; j < INTERNAL_ORDER - 1; j++)
+                tkeys[j + 1] = (int64_t)par->internal[j].key;
 
-            par->num_keys++;
-            par_n->dirty = 1;
+            for (uint32_t j = 0; j < pos; j++)
+                tchld[j] = par->internal[j].child;
+            tchld[pos]     = carry_left;
+            tchld[pos + 1] = carry_right;
+            for (uint32_t j = pos + 1; j < INTERNAL_ORDER; j++)
+                tchld[j + 1] = (j < INTERNAL_ORDER - 1) ? par->internal[j].child : par->pointer;
 
-            carry_split = 0;
-            carry_left = pe.id;
-            pthread_mutex_unlock(par_lock);
-            continue;
+            uint32_t sp     = (INTERNAL_ORDER + 1) / 2;
+            int64_t  up_key = tkeys[sp - 1];
+
+            for (uint32_t j = 0; j < sp - 1; j++)
+            {
+                par->internal[j].key   = (uint64_t)tkeys[j];
+                par->internal[j].child = tchld[j];
+            }
+            par->pointer  = tchld[sp - 1];
+            par->num_keys = sp - 1;
+            par_n->dirty  = 1;
+
+            node_id_t right_id    = overlay_new_temp(ov, 0);
+            overlay_node *right_n = overlay_get_mut(ov, right_id);
+            for (uint32_t j = sp; j < INTERNAL_ORDER; j++)
+            {
+                right_n->node.internal[j - sp].key   = (uint64_t)tkeys[j];
+                right_n->node.internal[j - sp].child = tchld[j];
+            }
+            right_n->node.pointer  = tchld[INTERNAL_ORDER];
+            right_n->node.num_keys = INTERNAL_ORDER - sp;
+            right_n->dirty         = 1;
+
+            carry_split = 1;
+            carry_right = right_id;
+            carry_left  = par_id;
+            carry_key   = up_key;
+
+            /* Release this ancestor's stripe lock (safe — propagation continues
+             * upward; HS_UNLOCK handles same-stripe with parent above).         */
+            HS_UNLOCK(overlay_node_lock(ov, par_id));
         }
 
-        int64_t tkeys[INTERNAL_ORDER];
-        node_id_t tchld[INTERNAL_ORDER + 1];
-
-        for (uint32_t j = 0; j < pos; j++)
-            tkeys[j] = (int64_t)par->internal[j].key;
-        tkeys[pos] = carry_key;
-        for (uint32_t j = pos; j < INTERNAL_ORDER - 1; j++)
-            tkeys[j + 1] = (int64_t)par->internal[j].key;
-
-        for (uint32_t j = 0; j < pos; j++)
-            tchld[j] = par->internal[j].child;
-        tchld[pos] = carry_left;
-        tchld[pos + 1] = carry_right;
-        for (uint32_t j = pos + 1; j < INTERNAL_ORDER; j++)
+        /* ---- Phase 4: root split ----
+         * root_lock must still be in hs[] because we only release it via
+         * HS_RELEASE_EXCEPT when the root is safe.  A carry_split that reaches
+         * here means the root was unsafe throughout, so root_lock is still held.*/
+        if (carry_split)
         {
-            tchld[j + 1] = (j < INTERNAL_ORDER - 1) ? par->internal[j].child : par->pointer;
+            node_id_t new_root_id = overlay_new_temp(ov, 0);
+            overlay_node *r       = overlay_get_mut(ov, new_root_id);
+            r->node.num_keys           = 1;
+            r->node.internal[0].key    = (uint64_t)carry_key;
+            r->node.internal[0].child  = carry_left;
+            r->node.pointer            = carry_right;
+            r->dirty                   = 1;
+            *root_id = new_root_id;   /* root_lock is in hs[], so this is safe */
         }
+    } /* end scoped block (cur_root, anc, ...) */
 
-        uint32_t sp = (INTERNAL_ORDER + 1) / 2;
-        int64_t up_key = tkeys[sp - 1];
+    HS_UNLOCK_ALL();
 
-        for (uint32_t j = 0; j < sp - 1; j++)
-        {
-            par->internal[j].key = (uint64_t)tkeys[j];
-            par->internal[j].child = tchld[j];
-        }
-        par->pointer = tchld[sp - 1];
-        par->num_keys = sp - 1;
-        par_n->dirty = 1;
-
-        node_id_t right_id = overlay_new_temp(ov, 0);
-        overlay_node *right_n = overlay_get_mut(ov, right_id);
-        for (uint32_t j = sp; j < INTERNAL_ORDER; j++)
-        {
-            right_n->node.internal[j - sp].key = (uint64_t)tkeys[j];
-            right_n->node.internal[j - sp].child = tchld[j];
-        }
-        right_n->node.pointer = tchld[INTERNAL_ORDER];
-        right_n->node.num_keys = INTERNAL_ORDER - sp;
-        right_n->dirty = 1;
-
-        carry_split = 1;
-        carry_left = pe.id;
-        carry_right = right_id;
-        carry_key = up_key;
-        pthread_mutex_unlock(par_lock);
-    }
-
-    if (carry_split)
-    {
-        node_id_t new_root_id = overlay_new_temp(ov, 0);
-        overlay_node *r = overlay_get_mut(ov, new_root_id);
-        r->node.num_keys = 1;
-        r->node.internal[0].key = (uint64_t)carry_key;
-        r->node.internal[0].child = carry_left;
-        r->node.pointer = carry_right;
-        r->dirty = 1;
-        pthread_mutex_lock(&ov->root_lock);
-        *root_id = new_root_id;
-        pthread_mutex_unlock(&ov->root_lock);
-    }
+latch_done:
+#undef HS_MAX
+#undef HS_LOCK
+#undef HS_UNLOCK
+#undef HS_UNLOCK_ALL
+#undef HS_RELEASE_EXCEPT
+    return;
 }
 
 static pagenum_t flush_overlay_node(overlay_state *ov, node_id_t id)
