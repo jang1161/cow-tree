@@ -117,6 +117,23 @@ static inline uint32_t zone_next(cow_tree *t, uint32_t zone_id)
     return (zone_id + 1 < t->info.nr_zones) ? (zone_id + 1) : t->info.nr_zones;
 }
 
+static void finish_zone_if_full(cow_tree *t, uint32_t zone_id)
+{
+    if (zone_id >= t->info.nr_zones)
+        return;
+
+    /* If zone is full, explicitly finish it to free the active zone slot */
+    if (atomic_load_explicit(&t->zone_full[zone_id], memory_order_acquire))
+    {
+        off_t zstart = (off_t)zone_id * t->info.zone_size;
+        if (zbd_finish_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
+        {
+            perror("zbd_finish_zones");
+            /* Don't exit, just log and continue */
+        }
+    }
+}
+
 static inline uint64_t overlay_hash_u64(uint64_t x)
 {
     x ^= x >> 30;
@@ -409,6 +426,7 @@ static uint32_t reserve_writable_zone(cow_tree *t)
 
         if (atomic_load_explicit(&t->zone_full[cur], memory_order_acquire))
         {
+            finish_zone_if_full(t, cur);
             uint32_t expected = cur;
             uint32_t next = zone_next(t, cur);
             atomic_compare_exchange_weak_explicit(
@@ -556,6 +574,8 @@ static void write_superblock_sync(cow_tree *t)
 
     if (t->meta_wp >= t->info.zone_size / PAGE_SIZE)
     {
+        /* Finish the old meta zone before activating the next one */
+        finish_zone_if_full(t, t->active_zone);
         uint32_t new_zone = 1 - t->active_zone;
         activate_meta_zone(t, new_zone, t->version + 1);
     }
@@ -1106,6 +1126,7 @@ static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
         if (base_wp + needed > zone_end)
         {
             atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
+            finish_zone_if_full(t, zone_id);
             uint32_t expected = zone_id;
             uint32_t next = zone_next(t, zone_id);
             atomic_compare_exchange_weak_explicit(
@@ -1218,6 +1239,7 @@ static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
         if (cur_wp >= zone_end_chk)
         {
             atomic_store_explicit(&t->zone_full[zone_id], 1, memory_order_release);
+            finish_zone_if_full(t, zone_id);
             uint32_t expected = zone_id;
             uint32_t next = zone_next(t, zone_id);
             atomic_compare_exchange_weak_explicit(
@@ -1499,6 +1521,7 @@ static void init_tl_cache_key_once(void)
 
 cow_tree *cow_open(const char *path)
 {
+    printf("CACHE_NUM_SETS: %d, CACHE_WAYS: %d \n", CACHE_NUM_SETS, CACHE_WAYS);
     /* Initialize thread-local cache key once */
     static pthread_once_t tl_cache_once = PTHREAD_ONCE_INIT;
     pthread_once(&tl_cache_once, init_tl_cache_key_once);
