@@ -21,6 +21,8 @@
 #include "cow_v3.h"
 #elif defined(COW_VARIANT_V3_MULTI_CACHE)
 #include "cow_v3_multi_cache.h"
+#elif defined(COW_VARIANT_GTX_CACHE)
+#include "cow_gtx_cache.h"
 #elif defined(COW_VARIANT_FINAL)
 #include "cow_final.h"
 #else

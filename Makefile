@@ -7,7 +7,7 @@ BUILD_DIR := build
 BIN_DIR := $(BUILD_DIR)/bin
 BENCH_SRC := bench/bench_main.c
 
-VARIANTS := ram ram_async shard ram_stage2 v3 v3_multi_cache final
+VARIANTS := ram ram_async shard ram_stage2 v3 v3_multi_cache gtx_cache final
 
 VAR_SRC_ram := src/variants/cow_ram.c
 VAR_HDR_ram := include/variants/cow_ram.h
@@ -38,6 +38,11 @@ VAR_SRC_v3_multi_cache := src/variants/cow_v3_multi_cache.c
 VAR_HDR_v3_multi_cache := include/variants/cow_v3_multi_cache.h
 VAR_DEF_v3_multi_cache := COW_VARIANT_V3_MULTI_CACHE
 VAR_DESC_v3_multi_cache := set-associative global cache
+
+VAR_SRC_gtx_cache := src/variants/cow_gtx_cache.c
+VAR_HDR_gtx_cache := include/variants/cow_gtx_cache.h
+VAR_DEF_gtx_cache := COW_VARIANT_GTX_CACHE
+VAR_DESC_gtx_cache := global TX + 8K-set 4-way cache
 
 VAR_SRC_zfs := src/variants/cow_zfs.c
 VAR_DESC_zfs := standalone zfs executable (has its own main)
@@ -122,6 +127,7 @@ compat: all
 	ln -sf $(BIN_DIR)/cow-bench-ram_async cow_test_ram_async
 	ln -sf $(BIN_DIR)/cow-bench-shard cow_test_shard
 	ln -sf $(BIN_DIR)/cow-bench-ram_stage2 cow_test_ram_stage2
+	ln -sf $(BIN_DIR)/cow-bench-gtx_cache cow_test_gtx_cache
 	ln -sf $(BIN_DIR)/cow-bench-zfs cow_test_zfs
 	ln -sf $(BIN_DIR)/cow-bench-final cow_test_final
 
@@ -131,4 +137,4 @@ clean:
 
 .PHONY: distclean
 distclean: clean
-	rm -f cow_test_ram cow_test_ram_async cow_test_shard cow_test_ram_stage2 cow_test_zfs cow_test_final
+	rm -f cow_test_ram cow_test_ram_async cow_test_shard cow_test_ram_stage2 cow_test_gtx_cache cow_test_zfs cow_test_final
