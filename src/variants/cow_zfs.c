@@ -31,8 +31,8 @@
 #define LEAF_ORDER 32      /* max 31 keys/leaf            */
 #define INTERNAL_ORDER 249 /* max 248 keys, 249 children  */
 #define MAX_APPEND_PAGES 64
-#define TX_TIMEOUT_NS (500000ULL) /* 500 µs */
-#define COMMIT_Q_DEPTH 4          /* pipeline depth: queued NVMe batches */
+#define TX_TIMEOUT_NS (2000000ULL) /* 2000 µs = 2 ms */
+#define COMMIT_Q_DEPTH 16         /* pipeline depth: queued NVMe batches */
 #define MAX_SERIAL_NODES 2048     /* upper bound on dirty nodes per TX */
 #define META_ZONE 0
 #define DATA_ZONE_START 1
@@ -158,21 +158,26 @@ static _Atomic(uint64_t) g_pages_appended;
 /* ─────────────────── Per-run metrics ─────────────────── */
 typedef struct
 {
-    _Atomic uint64_t tx_count;             /* TXs actually flushed              */
-    _Atomic uint64_t tx_joined_sum;        /* sum of joined counts per TX        */
-    _Atomic uint64_t tx_closed_by_count;   /* TXs closed because joined==expected*/
-    _Atomic uint64_t tx_closed_by_timeout; /* TXs closed by timeout              */
-    _Atomic uint64_t flush_ns_total;       /* reserved / unused after pipeline refactor     */
-    _Atomic uint64_t nvme_ns_total;        /* wall time inside zone_append_n     */
-    _Atomic uint64_t insert_ns_total;      /* sum of tree_insert() times         */
-    _Atomic uint64_t entry_wait_ns_total;  /* time waiting to join TX (phase 1)  */
-    _Atomic uint64_t epoch_wait_ns_total;  /* time waiting for TX completion      */
-    _Atomic uint64_t dirty_nodes_total;    /* total dirty nodes flushed           */
-    _Atomic uint64_t zone_advance_count;   /* number of zone transitions          */
-    _Atomic uint64_t restart_count;        /* wrlock-mode restarts in tree_insert */
-    _Atomic uint64_t serialize_ns_total;   /* parallel serialization time (summed)*/
-    _Atomic uint64_t commit_ns_total;      /* committer NVMe write time           */
-    _Atomic uint64_t commit_wait_ns_total; /* time closer waits for a free slot   */
+    _Atomic uint64_t tx_count;                  /* TXs actually flushed                         */
+    _Atomic uint64_t tx_joined_sum;             /* sum of joined counts per TX                  */
+    _Atomic uint64_t tx_closed_by_count;        /* TXs closed because joined==expected          */
+    _Atomic uint64_t tx_closed_by_timeout;      /* TXs closed by timeout                        */
+    _Atomic uint64_t nvme_ns_total;             /* wall time inside zone_append_n               */
+    _Atomic uint64_t insert_ns_total;           /* sum of tree_insert() times                   */
+    _Atomic uint64_t entry_wait_ns_total;       /* time waiting to join TX (phase 1)            */
+    _Atomic uint64_t epoch_wait_ns_total;       /* time waiting for TX completion                */
+    _Atomic uint64_t dirty_nodes_total;         /* total dirty nodes flushed                     */
+    _Atomic uint64_t zone_advance_count;        /* number of zone transitions                    */
+    _Atomic uint64_t restart_count;             /* wrlock-mode restarts in tree_insert           */
+    _Atomic uint64_t serialize_ns_total;        /* parallel serialization time (summed)          */
+    _Atomic uint64_t commit_ns_total;           /* committer NVMe write time                     */
+    _Atomic uint64_t commit_wait_ns_total;      /* time closer waits for a free slot             */
+    _Atomic uint64_t batch_formation_ns_sum;    /* sum of batch formation times (open → enqueue) */
+    _Atomic uint64_t batch_formation_count;     /* number of batches formed                      */
+    _Atomic uint64_t committer_stall_ns_sum;    /* sum of committer idle times between batches   */
+    _Atomic uint64_t committer_stall_count;     /* number of stalls measured                     */
+    _Atomic uint64_t req_e2e_ns_sum;            /* sum of request E2E latencies                  */
+    _Atomic uint64_t req_e2e_count;             /* number of requests measured                   */
 } run_metrics_t;
 
 static run_metrics_t g_metrics;
@@ -192,6 +197,8 @@ typedef struct
     pgn_t    root_pgn;          /* root page number for the superblock    */
     bool     needs_zone_finish; /* call zbd_finish_zones before writing   */
     uint32_t old_zone_id;       /* zone to finish (if needs_zone_finish)  */
+    uint64_t batch_open_ns;     /* TX open time (when first thread joined) */
+    uint64_t batch_enqueue_ns;  /* when batch was enqueued to committer   */
 } commit_batch_t;
 
 /* Per-slot write buffers: PAGE_SIZE-aligned for NVMe DMA.
@@ -209,6 +216,7 @@ static pthread_cond_t  g_cq_notempty; /* committer waits when empty */
 static pthread_cond_t  g_cq_notfull;  /* closer waits when full     */
 static bool            g_cq_shutdown;
 static pthread_t       g_committer;
+static _Atomic(uint64_t) g_committer_last_finish_ns = 0; /* for measuring stall */
 
 /* ─────────────────── TX machine ─────────────────── */
 typedef struct
@@ -226,10 +234,11 @@ typedef struct
     pthread_cond_t cond;
 
     /* Parallel serialization state (valid only while serializing=true) */
-    _Atomic int serial_claimed; /* next dfs_order[] index to serialize (atomic) */
-    _Atomic int serial_done;    /* workers finished their serialization duty     */
-    int serial_total;           /* total dirty nodes (= dfs_count at phase1)     */
-    int serial_buf_slot;        /* which g_serial_bufs[] slot workers write into */
+    _Atomic int serial_claimed;     /* batch index counter: 0..joined-1 (one per worker)*/
+    _Atomic int serial_done;        /* workers finished their serialization duty        */
+    int serial_total;               /* total dirty nodes (= dfs_count at phase1)        */
+    int serial_buf_slot;            /* which g_serial_bufs[] slot workers write into    */
+    int serial_batch_size;          /* nodes per worker batch = ceil(total / joined)    */
 } tx_t;
 
 static tx_t g_tx;
@@ -473,7 +482,18 @@ static void *committer_main(void *arg)
         if (batch.n_pages == 0)
             continue;
 
-        uint64_t t_commit = monotonic_ns();
+        /* Measure committer stall: idle time since last batch finished */
+        uint64_t t_batch_start = monotonic_ns();
+        uint64_t last_finish = atomic_load_explicit(&g_committer_last_finish_ns,
+                                                    memory_order_relaxed);
+        if (last_finish > 0)
+        {
+            uint64_t stall_ns = t_batch_start - last_finish;
+            atomic_fetch_add_explicit(&g_metrics.committer_stall_ns_sum,
+                                      stall_ns, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_metrics.committer_stall_count,
+                                      1, memory_order_relaxed);
+        }
 
         /* If this TX crossed a zone boundary, finish the old zone first. */
         if (batch.needs_zone_finish)
@@ -511,8 +531,13 @@ static void *committer_main(void *arg)
 
         write_superblock(batch.root_pgn);
 
+        uint64_t t_batch_end = monotonic_ns();
         atomic_fetch_add_explicit(&g_metrics.commit_ns_total,
-                                  monotonic_ns() - t_commit, memory_order_relaxed);
+                                  t_batch_end - t_batch_start, memory_order_relaxed);
+
+        /* Record finish time for next iteration's stall calculation */
+        atomic_store_explicit(&g_committer_last_finish_ns, t_batch_end,
+                              memory_order_relaxed);
     }
     return NULL;
 }
@@ -1016,6 +1041,9 @@ restart:
  */
 static void tx_insert(int64_t key, const char *value)
 {
+    /* Record E2E latency start */
+    uint64_t req_start_ns = monotonic_ns();
+
     /* ── Phase 1: wait to join an open TX ── */
     uint64_t t0 = monotonic_ns();
     pthread_mutex_lock(&g_tx.lock);
@@ -1085,17 +1113,21 @@ static void tx_insert(int64_t key, const char *value)
 
         /* DFS + zone advance + pagenum assign (fast, no NVMe). */
         commit_batch_t batch;
+        batch.batch_open_ns = g_tx.open_ns; /* record TX open time for batch formation metric */
         flush_prepare_phase1(reserved_slot, &batch);
 
         pthread_mutex_lock(&g_tx.lock);
         if (batch.n_pages > 0)
         {
+            batch.batch_enqueue_ns = monotonic_ns(); /* record when batch is enqueued */
             g_cq_slots[reserved_slot] = batch;
             atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
             atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
-            g_tx.serial_total    = batch.n_pages;
-            g_tx.serial_buf_slot = reserved_slot;
-            g_tx.serializing     = true;
+            g_tx.serial_total      = batch.n_pages;
+            g_tx.serial_buf_slot   = reserved_slot;
+            /* Compute batch size: ceil(total / joined) */
+            g_tx.serial_batch_size = (batch.n_pages + joined_snap - 1) / joined_snap;
+            g_tx.serializing       = true;
             atomic_fetch_add_explicit(&g_metrics.tx_count, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_metrics.tx_joined_sum, (uint64_t)joined_snap,
                                       memory_order_relaxed);
@@ -1111,6 +1143,12 @@ static void tx_insert(int64_t key, const char *value)
             pthread_mutex_unlock(&g_tx.lock);
             atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
                                       monotonic_ns() - t0, memory_order_relaxed);
+            /* Record E2E latency */
+            uint64_t req_e2e_ns = monotonic_ns() - req_start_ns;
+            atomic_fetch_add_explicit(&g_metrics.req_e2e_ns_sum, req_e2e_ns,
+                                      memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_metrics.req_e2e_count, 1,
+                                      memory_order_relaxed);
             return;
         }
         pthread_cond_broadcast(&g_tx.cond); /* wake workers to serialize */
@@ -1121,27 +1159,38 @@ static void tx_insert(int64_t key, const char *value)
     {
         if (g_tx.serializing)
         {
-            int idx        = atomic_fetch_add_explicit(&g_tx.serial_claimed, 1,
+            /* Fix #3A: Batched work assignment to reduce atomic contention.
+             * Each worker claims a batch ID (0..joined-1) and processes its
+             * assigned work range sequentially, minimizing cache line bouncing.
+             */
+            int batch_id   = atomic_fetch_add_explicit(&g_tx.serial_claimed, 1,
                                                        memory_order_relaxed);
             int total      = g_tx.serial_total;
             int slot       = g_tx.serial_buf_slot;
+            int batch_size = g_tx.serial_batch_size;
             int joined_snap = g_tx.joined; /* stable: TX closed, no new joiners */
 
-            if (idx < total)
+            /* Compute work range for this worker's batch */
+            int batch_start = batch_id * batch_size;
+            int batch_end   = (batch_id + 1) * batch_size;
+            if (batch_end > total)
+                batch_end = total;
+
+            /* Process all work in this batch without further atomics */
+            pthread_mutex_unlock(&g_tx.lock);
+            for (int idx = batch_start; idx < batch_end; idx++)
             {
                 nid_t   nid = dfs_order[idx];
                 uint8_t *dst = g_serial_bufs[slot] + (size_t)idx * PAGE_SIZE;
-                pthread_mutex_unlock(&g_tx.lock);
 
                 uint64_t t_ser = monotonic_ns();
                 build_disk_page(dst, nid);
                 atomic_fetch_add_explicit(&g_metrics.serialize_ns_total,
                                           monotonic_ns() - t_ser, memory_order_relaxed);
-
-                pthread_mutex_lock(&g_tx.lock);
             }
-            /* Workers with idx >= total skip building but still count as done. */
+            pthread_mutex_lock(&g_tx.lock);
 
+            /* Barrier: synchronize all workers */
             int done = atomic_fetch_add_explicit(&g_tx.serial_done, 1,
                                                  memory_order_relaxed) + 1;
             if (done == joined_snap)
@@ -1158,6 +1207,17 @@ static void tx_insert(int64_t key, const char *value)
                 g_cq_count++;
                 pthread_cond_signal(&g_cq_notempty);
                 pthread_mutex_unlock(&g_cq_lock);
+
+                /* Record batch formation time: from TX open to enqueue */
+                uint64_t batch_open = g_cq_slots[slot].batch_open_ns;
+                uint64_t batch_enqueue = g_cq_slots[slot].batch_enqueue_ns;
+                if (batch_open > 0 && batch_enqueue > batch_open)
+                {
+                    atomic_fetch_add_explicit(&g_metrics.batch_formation_ns_sum,
+                                              batch_enqueue - batch_open, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&g_metrics.batch_formation_count,
+                                              1, memory_order_relaxed);
+                }
 
                 g_tx.epoch++;
                 g_tx.joined = 0; g_tx.done = 0;
@@ -1211,11 +1271,13 @@ static void tx_insert(int64_t key, const char *value)
                                               monotonic_ns() - t_cw, memory_order_relaxed);
 
                     commit_batch_t batch;
+                    batch.batch_open_ns = g_tx.open_ns; /* record TX open time for batch formation metric */
                     flush_prepare_phase1(reserved_slot, &batch);
 
                     pthread_mutex_lock(&g_tx.lock);
                     if (batch.n_pages > 0)
                     {
+                        batch.batch_enqueue_ns = monotonic_ns(); /* record when batch is enqueued */
                         g_cq_slots[reserved_slot] = batch;
                         atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
                         atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
@@ -1236,6 +1298,12 @@ static void tx_insert(int64_t key, const char *value)
                         pthread_mutex_unlock(&g_tx.lock);
                         atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
                                                   monotonic_ns() - t0, memory_order_relaxed);
+                        /* Record E2E latency */
+                        uint64_t req_e2e_ns = monotonic_ns() - req_start_ns;
+                        atomic_fetch_add_explicit(&g_metrics.req_e2e_ns_sum, req_e2e_ns,
+                                                  memory_order_relaxed);
+                        atomic_fetch_add_explicit(&g_metrics.req_e2e_count, 1,
+                                                  memory_order_relaxed);
                         return;
                     }
                     pthread_cond_broadcast(&g_tx.cond);
@@ -1251,6 +1319,13 @@ static void tx_insert(int64_t key, const char *value)
     atomic_fetch_add_explicit(&g_metrics.epoch_wait_ns_total,
                               monotonic_ns() - t0, memory_order_relaxed);
     pthread_mutex_unlock(&g_tx.lock);
+
+    /* Record E2E latency */
+    uint64_t req_e2e_ns = monotonic_ns() - req_start_ns;
+    atomic_fetch_add_explicit(&g_metrics.req_e2e_ns_sum, req_e2e_ns,
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_metrics.req_e2e_count, 1,
+                              memory_order_relaxed);
 }
 
 /* ─────────────────── Worker threads ─────────────────── */
@@ -1466,7 +1541,6 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     uint64_t joined_sum = atomic_load_explicit(&g_metrics.tx_joined_sum, memory_order_relaxed);
     uint64_t by_count = atomic_load_explicit(&g_metrics.tx_closed_by_count, memory_order_relaxed);
     uint64_t by_timeout = atomic_load_explicit(&g_metrics.tx_closed_by_timeout, memory_order_relaxed);
-    uint64_t flush_ns    = atomic_load_explicit(&g_metrics.flush_ns_total,       memory_order_relaxed);
     uint64_t commit_ns   = atomic_load_explicit(&g_metrics.commit_ns_total,      memory_order_relaxed);
     uint64_t ser_ns      = atomic_load_explicit(&g_metrics.serialize_ns_total,   memory_order_relaxed);
     uint64_t cw_ns       = atomic_load_explicit(&g_metrics.commit_wait_ns_total, memory_order_relaxed);
@@ -1477,19 +1551,22 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     uint64_t dirty_tot = atomic_load_explicit(&g_metrics.dirty_nodes_total, memory_order_relaxed);
     uint64_t zone_adv = atomic_load_explicit(&g_metrics.zone_advance_count, memory_order_relaxed);
     uint64_t restarts = atomic_load_explicit(&g_metrics.restart_count, memory_order_relaxed);
+    uint64_t batch_form_ns_sum = atomic_load_explicit(&g_metrics.batch_formation_ns_sum, memory_order_relaxed);
+    uint64_t batch_form_count = atomic_load_explicit(&g_metrics.batch_formation_count, memory_order_relaxed);
+    uint64_t comm_stall_ns_sum = atomic_load_explicit(&g_metrics.committer_stall_ns_sum, memory_order_relaxed);
+    uint64_t comm_stall_count = atomic_load_explicit(&g_metrics.committer_stall_count, memory_order_relaxed);
+    uint64_t req_e2e_ns_sum = atomic_load_explicit(&g_metrics.req_e2e_ns_sum, memory_order_relaxed);
+    uint64_t req_e2e_count = atomic_load_explicit(&g_metrics.req_e2e_count, memory_order_relaxed);
 
     double avg_joined = tx_n ? (double)joined_sum / tx_n : 0.0;
     double avg_dirty = tx_n ? (double)dirty_tot / tx_n : 0.0;
-    double avg_flush_ms   = tx_n ? (double)flush_ns  / tx_n / 1e6 : 0.0;
     double avg_commit_ms  = tx_n ? (double)commit_ns  / tx_n / 1e6 : 0.0;
     double avg_ser_ms     = tx_n ? (double)ser_ns     / tx_n / 1e6 : 0.0;
-    double total_flush_ms = (double)flush_ns  / 1e6;
     double total_commit_ms = (double)commit_ns / 1e6;
     double total_ser_ms   = (double)ser_ns    / 1e6;
     double total_cw_ms    = (double)cw_ns     / 1e6;
     double total_nvme_ms  = (double)nvme_ns   / 1e6;
     double nvme_pct = commit_ns ? (double)nvme_ns / commit_ns * 100.0 : 0.0;
-    (void)avg_flush_ms;
     double ins_s = (double)ins_ns / 1e9;
     double entry_s = (double)entry_ns / 1e9;
     double epoch_s = (double)epoch_ns / 1e9;
@@ -1497,6 +1574,9 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     double by_count_pct = closed_total ? (double)by_count / closed_total * 100.0 : 0.0;
     double by_timeout_pct = closed_total ? (double)by_timeout / closed_total * 100.0 : 0.0;
     double restarts_per = num_keys ? (double)restarts / num_keys : 0.0;
+    double avg_batch_formation_us = batch_form_count ? (double)batch_form_ns_sum / batch_form_count / 1e3 : 0.0;
+    double avg_committer_stall_us = comm_stall_count ? (double)comm_stall_ns_sum / comm_stall_count / 1e3 : 0.0;
+    double avg_req_e2e_us = req_e2e_count ? (double)req_e2e_ns_sum / req_e2e_count / 1e3 : 0.0;
 
     printf("  [TX]\n");
     printf("    total TXs:            %lu\n", (unsigned long)tx_n);
@@ -1513,7 +1593,10 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
            total_nvme_ms, nvme_pct);
     printf("    commit_wait (closer): %.1f ms  (time waiting for free slot)\n", total_cw_ms);
     printf("    zone advances:        %lu\n", (unsigned long)zone_adv);
-    (void)total_flush_ms;
+    printf("  [Pipeline Performance Metrics]\n");
+    printf("    avg batch formation:  %.2f µs  (time: TX open → batch enqueue)\n", avg_batch_formation_us);
+    printf("    avg committer stall:  %.2f µs  (idle time between batches)\n", avg_committer_stall_us);
+    printf("    avg request E2E:      %.2f µs  (total time per insert call)\n", avg_req_e2e_us);
     printf("  [Thread time, summed across all threads]\n");
     printf("    tree_insert:          %.3f s\n", ins_s);
     printf("    waiting to join TX:   %.3f s\n", entry_s);

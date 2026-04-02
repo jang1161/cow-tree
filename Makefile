@@ -64,7 +64,7 @@ RUN_MODE := $(or $(MODE),$(word 2,$(RUN_POS_ARGS)),0)
 RUN_DEV := $(or $(DEV),$(word 3,$(RUN_POS_ARGS)),/dev/nvme3n2)
 
 .PHONY: all
-all: $(addprefix $(BIN_DIR)/cow-bench-,$(VARIANTS)) $(BIN_DIR)/cow-bench-zfs
+all: $(addprefix $(BIN_DIR)/cow-bench-,$(VARIANTS)) $(BIN_DIR)/cow-bench-zfs $(BIN_DIR)/cow-bench-zfs-shard
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -92,6 +92,17 @@ bench-zfs: $(BIN_DIR)/cow-bench-zfs
 .PHONY: run-zfs
 run-zfs: bench-zfs
 	sudo ./$(BIN_DIR)/cow-bench-zfs $(RUN_KEYS) $(RUN_MODE) $(RUN_DEV)
+
+VAR_SRC_zfs_shard := src/variants/cow_zfs_shard.c
+$(BIN_DIR)/cow-bench-zfs-shard: $(VAR_SRC_zfs_shard) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(VAR_SRC_zfs_shard) -o $@ $(LDFLAGS) $(LIBS)
+
+.PHONY: bench-zfs-shard
+bench-zfs-shard: $(BIN_DIR)/cow-bench-zfs-shard
+
+.PHONY: run-zfs-shard
+run-zfs-shard: bench-zfs-shard
+	sudo ./$(BIN_DIR)/cow-bench-zfs-shard $(RUN_KEYS) $(RUN_MODE) $(RUN_DEV)
 
 .PHONY: bench
 bench: bench-$(DEFAULT_VARIANT)
