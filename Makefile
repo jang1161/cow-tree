@@ -7,7 +7,7 @@ BUILD_DIR := build
 BIN_DIR := $(BUILD_DIR)/bin
 BENCH_SRC := bench/bench_main.c
 
-VARIANTS := ram ram_async ram2 shard ram_stage2 v3 v3_multi_cache final
+VARIANTS := ram ram_async shard ram_stage2 v3 v3_multi_cache final
 
 VAR_SRC_ram := src/variants/cow_ram.c
 VAR_HDR_ram := include/variants/cow_ram.h
@@ -18,11 +18,6 @@ VAR_SRC_ram_async := src/variants/cow_ram_async.c
 VAR_HDR_ram_async := include/variants/cow_ram_async.h
 VAR_DEF_ram_async := COW_VARIANT_RAM_ASYNC
 VAR_DESC_ram_async := async flush pipeline
-
-VAR_SRC_ram2 := src/variants/cow_ram2.c
-VAR_HDR_ram2 := include/variants/cow_ram2.h
-VAR_DEF_ram2 := COW_VARIANT_RAM2
-VAR_DESC_ram2 := sharded writers
 
 VAR_SRC_shard := src/variants/cow_shard.c
 VAR_HDR_shard := include/variants/cow_shard.h
@@ -114,7 +109,6 @@ list:
 compat: all
 	ln -sf $(BIN_DIR)/cow-bench-ram cow_test_ram
 	ln -sf $(BIN_DIR)/cow-bench-ram_async cow_test_ram_async
-	ln -sf $(BIN_DIR)/cow-bench-ram2 cow_test_ram2
 	ln -sf $(BIN_DIR)/cow-bench-shard cow_test_shard
 	ln -sf $(BIN_DIR)/cow-bench-ram_stage2 cow_test_ram_stage2
 	ln -sf $(BIN_DIR)/cow-bench-zfs cow_test_zfs
@@ -126,4 +120,4 @@ clean:
 
 .PHONY: distclean
 distclean: clean
-	rm -f cow_test_ram cow_test_ram_async cow_test_ram2 cow_test_shard cow_test_ram_stage2 cow_test_zfs cow_test_final
+	rm -f cow_test_ram cow_test_ram_async cow_test_shard cow_test_ram_stage2 cow_test_zfs cow_test_final

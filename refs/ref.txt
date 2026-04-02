@@ -1,0 +1,40 @@
+#ref1_mrallc (refs/ref1_mrallc)
+- 코드/문서 단서:
+  - README에서 "asynchronous" + "copy-on-write immutable root"를 명시
+  - API가 `add(path, value, cb)`, `scan(root, ...)`, `get(root, ...)` 형태로 루트 ID를 인자로 전달
+  - COW는 `cow(path, node, cb)`에서 부모를 재작성해 새 루트 ID를 만들어 반환
+- 동시성/락 관점 정리:
+  - 내부에 pthread mutex/rwlock/CAS/atomic 시퀀스 제어는 없음
+  - Node.js 단일 이벤트 루프(콜백 비동기) 모델 전제라, 동일 프로세스 내 병렬 write 경쟁을 락으로 제어하지 않음
+  - "snapshot"은 전역 seq가 아니라, 호출자가 들고 있는 root ID 자체가 버전 역할
+  - 즉, 멀티스레드 동시성 제어 구현이라기보다 "버전 루트 전달형 immutable COW" 모델
+
+ref2_boisterous (refs/ref2_boisterous, OceanBase COW btree 포크)
+- 코드 단서(동시성 관련):
+  - `BtreeBase::get_read_handle`에서 `root_pointer_`를 잡고 `refcas`로 refcount 증가(CAS)
+  - `BtreeWriteHandle::start/end`에서 `pthread_mutex_lock/unlock`로 write 구간 보호
+  - `BtreeBase::callback_done`에서 새 root publish 후 old root를 recycle list로 이동, refcount/sequence 기반 회수
+  - `KeyBtree` 생성자에서 기본적으로 `set_write_lock_enable(true)` 적용
+- 동시성/락 관점 정리:
+  - Read: lock-free에 가까운 read snapshot 핸들(`root_pointer_` + refcount CAS)
+  - Write: 기본 설정에서 전역 write mutex 직렬화(쓰기 핸들 획득~종료까지 보호)
+  - Publish: optimistic retry(CAS publish loop) 방식이 아니라, write lock 하에서 root pointer 교체
+  - GC/회수: root sequence + refcount(CAS) 조합으로 아직 참조 중인 세대는 남기고, 안전한 세대만 node 해제
+  - 결론적으로 "read는 snapshot/CAS, write는 mutex 직렬화" 혼합 모델
+
+ref3_bt reference architecture (refs/ref3_bt)
+- 핵심 구조만 요약:
+  - insert/lookup/remove는 tree read lock으로 진입
+  - clone은 tree write lock 사용
+  - write 대상 노드는 fs_refcount 기반으로 COW 여부 결정
+  - COW로 주소가 바뀌면 부모 child pointer를 즉시 갱신
+
+## 16) ref5_zfs (refs/ref5_zfs, OpenZFS reference)
+- 핵심 구조 요약:
+  - txg(open -> quiescing -> syncing) 파이프라인으로 write를 그룹 커밋
+  - write path는 dmu_tx assign/commit 후 sync 단계에서 실제 반영
+  - sync context는 일관성 지점에서 트리를 갱신하고 uberblock을 publish
+  - 백그라운드 flush/sync 작업과 호출자 경로를 분리해 내구성/처리량 균형을 맞춤
+- 동시성 관점:
+  - 단일 전역 락 모델이 아니라 역할별 lock/refcount/taskq 조합
+  - read는 스냅샷 관점 유지, write는 txg 경계에서 정합

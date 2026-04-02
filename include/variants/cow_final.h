@@ -21,7 +21,7 @@
 #define INTERNAL_ORDER 249
 
 #define CACHE_NUM_SETS (4096 * 4)
-#define CACHE_WAYS 4
+#define CACHE_WAYS 2
 
 typedef uint64_t pagenum_t;
 #define INVALID_PGN ((pagenum_t) - 1)

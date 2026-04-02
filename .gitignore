@@ -6,7 +6,6 @@ logs*
 refs/ref4_btrfs/btrfs
 CLAUDE.md
 .claude/
-.gitignore
 
 # Local benchmark binaries (legacy names)
 cow_test_bt

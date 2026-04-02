@@ -121,12 +121,35 @@ keep_sudo_alive() {
 
 keep_sudo_alive &
 SUDO_KEEPALIVE_PID=$!
+
+CURRENT_RUN_PID=""
+CURRENT_FIFO=""
+
 cleanup() {
     if [[ -n "${SUDO_KEEPALIVE_PID:-}" ]]; then
         kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM
+
+handle_interrupt() {
+    echo ""
+    echo "[INFO] interrupted; stopping benchmark..."
+
+    if [[ -n "${CURRENT_RUN_PID:-}" ]]; then
+        kill "$CURRENT_RUN_PID" 2>/dev/null || true
+        pkill -TERM -P "$CURRENT_RUN_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "${CURRENT_FIFO:-}" ]]; then
+        rm -f "$CURRENT_FIFO" 2>/dev/null || true
+    fi
+
+    cleanup
+    exit 130
+}
+
+trap cleanup EXIT
+trap handle_interrupt INT TERM
 
 ensure_binary() {
     local variant="$1"
@@ -179,6 +202,7 @@ run_group() {
         local make_pid
         fifo=$(mktemp -u)
         mkfifo "$fifo"
+        CURRENT_FIFO="$fifo"
 
         if command -v stdbuf >/dev/null 2>&1; then
             sudo stdbuf -oL -eL "$bench_bin" "$keys" 0 "$DEV" > "$fifo" 2>&1 &
@@ -186,6 +210,7 @@ run_group() {
             sudo "$bench_bin" "$keys" 0 "$DEV" > "$fifo" 2>&1 &
         fi
         make_pid=$!
+        CURRENT_RUN_PID="$make_pid"
 
         while IFS= read -r line; do
             if [[ "$line" =~ ^Threads:[[:space:]]*([0-9]+) ]]; then
@@ -204,12 +229,15 @@ run_group() {
         done < "$fifo"
 
         rm -f "$fifo"
+        CURRENT_FIFO=""
 
         if ! wait "$make_pid"; then
             echo "" >> "$OUTFILE"
             echo "[ERROR] run failed: label=$label run=$run" >&2
             exit 1
         fi
+
+        CURRENT_RUN_PID=""
 
         while (( parsed_count < ${#THREADS[@]} )); do
             printf "%10s" "ERR" >> "$OUTFILE"
