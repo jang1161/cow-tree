@@ -18,6 +18,7 @@ Average           2373      4180      6966     11309     15421     18134     201
 
 CACHE_NUM_SETS (4096 * 2)
 CACHE_WAYS 4
+Almost same as SETS (4096 * 4) * WAYS 2
 1M
 threads              1         2         4         8        16        32        64
 Average           2286      3893      6142      9644     12004     13596     14879

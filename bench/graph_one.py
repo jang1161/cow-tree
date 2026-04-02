@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 
 # Data
 threads = [1, 2, 4, 8, 16, 32, 64]
-throughput = [2377.80, 4194.99, 6894.47, 11535.63, 15025.07, 17937.71, 19830.08]
+throughput = [2373, 4180, 6966, 11309, 15421, 18134, 20148]
 
 # Plot
 plt.figure(figsize=(9, 5))  # (가로, 세로)
@@ -24,5 +24,5 @@ plt.yticks([0, 20000, 40000, 60000])
 plt.grid(True, which="both", linestyle='--', linewidth=0.5)
 
 # Save as PNG
-plt.savefig('results/graphs/final_1M_60kScale.png')
+plt.savefig('results/graphs/final_1M_60kScale2.png')
 plt.show()
