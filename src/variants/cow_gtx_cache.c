@@ -1,7 +1,13 @@
 /*
-gcc -O2 -g -Wall -Wextra -std=c11 -pthread -Iinclude/variants -I. -DCOW_VARIANT_FINAL=1 \
-  bench/bench_main.c src/variants/cow_final.c -o build/bin/cow-bench-final \
-       -lzbd -lnvme -lpthread
+ * Architecture: Global Page Cache + Sorting Batch Processing
+ * - 샤드 대신 4-Way 세트 연관 글로벌 페이지 캐시를 도입하여 메모리 효율 극대화
+ * - 워커 스레드는 큐에 요청만 삽입하고, 전담 스레드가 키 순서 정렬 후 트리 반영
+ * - 개별 스레드의 직접 수정을 배제하고 배치(Batch) 단위로 I/O 병합 성능을 높인 최종형
+
+gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
+-Iinclude -Iinclude/variants -I. \
+src/variants/cow_gtx_cache.c \
+-o build/bin/cow-bench-gtx_cache
 */
 
 #define _GNU_SOURCE

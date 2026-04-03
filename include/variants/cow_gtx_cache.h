@@ -1,3 +1,10 @@
+/*
+gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
+-Iinclude -Iinclude/variants -I. \
+src/variants/cow_gtx_cache.c \
+-o build/bin/cow-bench-gtx_cache
+*/
+
 #pragma once
 
 #include <libnvme.h>
@@ -20,7 +27,7 @@
 #define LEAF_ORDER 32
 #define INTERNAL_ORDER 249
 
-#define CACHE_NUM_SETS 8192
+#define CACHE_NUM_SETS (4096 * 4 * 12)
 #define CACHE_WAYS 4
 
 typedef uint64_t pagenum_t;
