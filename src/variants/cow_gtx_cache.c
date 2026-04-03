@@ -123,6 +123,11 @@ static inline uint32_t zone_next(cow_tree *t, uint32_t zone_id)
     return (zone_id + 1 < t->info.nr_zones) ? (zone_id + 1) : t->info.nr_zones;
 }
 
+static inline uint32_t other_meta_zone(uint32_t zone_id)
+{
+    return (zone_id == META_ZONE_0) ? META_ZONE_1 : META_ZONE_0;
+}
+
 static void finish_zone_if_full(cow_tree *t, uint32_t zone_id)
 {
     if (zone_id >= t->info.nr_zones)
@@ -425,6 +430,25 @@ static void activate_meta_zone(cow_tree *t, uint32_t zone_id, uint64_t version)
     t->version = version;
 }
 
+static void rotate_meta_zone(cow_tree *t)
+{
+    uint32_t old_zone = t->active_zone;
+    uint32_t new_zone = other_meta_zone(old_zone);
+
+    /* Finish the old zone, then recycle it so the pair alternates cleanly. */
+    finish_zone_if_full(t, old_zone);
+    if (zbd_reset_zones(t->fd, (off_t)old_zone * t->info.zone_size,
+                        (off_t)t->info.zone_size) != 0)
+    {
+        perror("zbd_reset_zones(old_meta_zone)");
+        exit(EXIT_FAILURE);
+    }
+    atomic_store_explicit(&t->zone_wp_bytes[old_zone], t->zones[old_zone].start, memory_order_release);
+    atomic_store_explicit(&t->zone_full[old_zone], 0, memory_order_release);
+
+    activate_meta_zone(t, new_zone, t->version + 1);
+}
+
 static void load_superblock(cow_tree *t)
 {
     zone_header zh0, zh1;
@@ -502,12 +526,10 @@ static void write_superblock_sync(cow_tree *t)
 
     t->durable_sb.magic = SB_MAGIC;
 
-    if (t->meta_wp >= t->info.zone_size / PAGE_SIZE)
+    if (t->meta_wp >= t->zones[t->active_zone].capacity / PAGE_SIZE)
     {
-        /* Finish the old meta zone before activating the next one */
-        finish_zone_if_full(t, t->active_zone);
-        uint32_t new_zone = 1 - t->active_zone;
-        activate_meta_zone(t, new_zone, t->version + 1);
+        printf("[DEBUG] Meta zone full simulation! Rotating to other zone...\n");
+        rotate_meta_zone(t);
     }
 
     pagenum_t ignored_pn;
