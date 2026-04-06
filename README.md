@@ -28,7 +28,7 @@ make all
 ```bash
 make bench-gtx_cache
 make bench-zfs
-make bench-zfs-gtx
+make bench-zfs-shard
 ```
 
 3. 사용 가능한 버전 목록
@@ -90,5 +90,5 @@ make run 1000000 0 /dev/nvme3n2
 - `gtx_cache`
 - `gtx_cache_p`
 - `zfs`
-- `zfs-gtx`
+- `zfs-shard`
 - `zfs-shard-cache`

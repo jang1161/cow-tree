@@ -3,12 +3,12 @@
  * - 트리를 12개 샤드로 물리적으로 분할하여 삽입 시 락 경합을 최소화함
  * - 모든 샤드가 단일 '글로벌 TX' 에포크를 공유하여 동기화됨
  * - flush_prepare_phase1_global: 12개 샤드의 수정사항을 단일 NVMe 쓰기 배치로 통합
- * 
+ *
  * Build:
  *   gcc -O2 -g -Wall -Wextra -std=c11 -pthread -Iinclude -Iinclude/variants \
- *       -I. src/variants/cow_zfs_gtx.c -o build/bin/cow-bench-zfs-gtx -lzbd -lnvme -lpthread
+ *       -I. src/variants/cow_zfs_shard.c -o build/bin/cow-bench-zfs-shard -lzbd -lnvme -lpthread
  * Run:
- *   sudo ./build/bin/cow-bench-zfs-gtx <num_keys> <thread_mode> [dev]
+ *   sudo ./build/bin/cow-bench-zfs-shard <num_keys> <thread_mode> [dev]
  *   thread_mode: 0=sweep 1/2/4/8/16/32/64=specific count
  */
 
@@ -31,13 +31,13 @@
 #define N_SHARDS 12
 #define SHARD_MAX_SERIAL_NODES 256
 /* Global TX combines all shards: worst case N_SHARDS * SHARD_MAX_SERIAL_NODES dirty nodes */
-#define GLOBAL_MAX_SERIAL_NODES (N_SHARDS * SHARD_MAX_SERIAL_NODES)  /* 2048 */
+#define GLOBAL_MAX_SERIAL_NODES (N_SHARDS * SHARD_MAX_SERIAL_NODES) /* 2048 */
 #define PAGE_SIZE 4096
 #define LEAF_ORDER 32      /* max 31 keys/leaf            */
 #define INTERNAL_ORDER 249 /* max 248 keys, 249 children  */
 #define MAX_APPEND_PAGES 64
 #define TX_TIMEOUT_NS (2000000ULL) /* 2000 µs = 2 ms */
-#define COMMIT_Q_DEPTH 16         /* pipeline depth: queued NVMe batches */
+#define COMMIT_Q_DEPTH 16          /* pipeline depth: queued NVMe batches */
 #define META_ZONE 0
 #define DATA_ZONE_START 2
 #define SB_MAGIC 0x434F574252414D31ULL
@@ -153,16 +153,16 @@ static run_metrics_t g_metrics;
  */
 typedef struct
 {
-    int      n_pages;
-    int      buf_slot;
+    int n_pages;
+    int buf_slot;
     uint32_t zone_id;
-    pgn_t    root_pgn;
-    bool     needs_zone_finish;
+    pgn_t root_pgn;
+    bool needs_zone_finish;
     uint32_t old_zone_id;
     uint64_t batch_open_ns;
     uint64_t batch_enqueue_ns;
     uint64_t seq_no;
-    bool     ready;
+    bool ready;
 } commit_batch_t;
 
 /* ─────────────────── Global TX machine ─────────────────── */
@@ -174,7 +174,7 @@ typedef struct
 typedef struct
 {
     uint64_t epoch;
-    int expected;       /* = num_threads for current run */
+    int expected; /* = num_threads for current run */
     int joined;
     int done;
     bool closed;
@@ -186,11 +186,11 @@ typedef struct
     pthread_cond_t cond;
 
     /* Parallel serialization state (valid only while serializing=true) */
-    _Atomic int serial_claimed;   /* next batch index for workers to claim */
-    _Atomic int serial_done;      /* workers that finished serialization    */
-    int serial_total;             /* total dirty nodes across all shards    */
-    int serial_buf_slot;          /* which g_global_serial_bufs[] slot      */
-    int serial_batch_size;        /* nodes per worker = ceil(total/joined)  */
+    _Atomic int serial_claimed; /* next batch index for workers to claim */
+    _Atomic int serial_done;    /* workers that finished serialization    */
+    int serial_total;           /* total dirty nodes across all shards    */
+    int serial_buf_slot;        /* which g_global_serial_bufs[] slot      */
+    int serial_batch_size;      /* nodes per worker = ceil(total/joined)  */
 } global_tx_t;
 
 static global_tx_t g_tx;
@@ -203,8 +203,8 @@ static global_tx_t g_tx;
  * these arrays; the mutex/cond broadcast provides the required memory barrier.
  */
 static nid_t g_global_dfs_order[GLOBAL_MAX_SERIAL_NODES];
-static int   g_global_dfs_shard[GLOBAL_MAX_SERIAL_NODES];
-static int   g_global_dfs_count;
+static int g_global_dfs_shard[GLOBAL_MAX_SERIAL_NODES];
+static int g_global_dfs_count;
 
 /* How many shards are active for the current run (set by run_benchmark) */
 static int g_active_shards;
@@ -232,7 +232,7 @@ typedef struct shard_t
     pthread_rwlock_t *node_locks;
     nid_t root;
     pthread_rwlock_t root_lock;
-    nid_t dfs_order[SHARD_MAX_SERIAL_NODES * 2];  /* scratch for DFS traversal */
+    nid_t dfs_order[SHARD_MAX_SERIAL_NODES * 2]; /* scratch for DFS traversal */
     int dfs_count;
     uint8_t _pad[64];
 } shard_t;
@@ -454,7 +454,7 @@ static void flush_prepare_phase1_global(int buf_slot, uint64_t batch_seq,
 
     /* Assign pagenums sequentially across all shards' dirty nodes in one atomic bump. */
     pgn_t base_pgn = (pgn_t)atomic_fetch_add_explicit(&g_global_pagenum, (uint64_t)total,
-                                                       memory_order_relaxed);
+                                                      memory_order_relaxed);
     for (int i = 0; i < total; i++)
     {
         int si = g_global_dfs_shard[i];
@@ -464,12 +464,12 @@ static void flush_prepare_phase1_global(int buf_slot, uint64_t batch_seq,
     g_zone_wp += (uint64_t)total;
     pthread_mutex_unlock(&g_zone_lock);
 
-    batch->n_pages           = total;
-    batch->buf_slot          = buf_slot;
-    batch->zone_id           = g_cur_zone;
+    batch->n_pages = total;
+    batch->buf_slot = buf_slot;
+    batch->zone_id = g_cur_zone;
     batch->needs_zone_finish = need_finish;
-    batch->old_zone_id       = old_zone;
-    batch->seq_no            = batch_seq;
+    batch->old_zone_id = old_zone;
+    batch->seq_no = batch_seq;
     /* batch->root_pgn is set by the last serializer */
 }
 
@@ -529,7 +529,7 @@ static void *committer_main(void *arg)
         if (batch.needs_zone_finish)
         {
             off_t zstart = (off_t)g_zones[batch.old_zone_id].start;
-            off_t zlen   = (off_t)g_zones[batch.old_zone_id].len;
+            off_t zlen = (off_t)g_zones[batch.old_zone_id].len;
             if (zbd_finish_zones(g_fd, zstart, zlen) != 0)
             {
                 perror("zbd_finish_zones");
@@ -613,7 +613,7 @@ static pgn_t flush_shard_sync(shard_t *s)
     }
 
     pgn_t base_pgn = (pgn_t)atomic_fetch_add_explicit(&g_global_pagenum, (uint64_t)total,
-                                                       memory_order_relaxed);
+                                                      memory_order_relaxed);
     for (int i = 0; i < total; i++)
         s->pool[s->dfs_order[i]].pagenum = base_pgn + (pgn_t)i;
     g_zone_wp += (uint64_t)total;
@@ -623,7 +623,7 @@ static pgn_t flush_shard_sync(shard_t *s)
     if (need_finish)
     {
         off_t zstart = (off_t)g_zones[old_zone].start;
-        off_t zlen   = (off_t)g_zones[old_zone].len;
+        off_t zlen = (off_t)g_zones[old_zone].len;
         if (zbd_finish_zones(g_fd, zstart, zlen) != 0)
             perror("zbd_finish_zones");
     }
@@ -1132,11 +1132,11 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
         {
             g_cq_slots[reserved_slot] = batch;
             atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
-            atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
-            g_tx.serial_total      = batch.n_pages;
-            g_tx.serial_buf_slot   = reserved_slot;
+            atomic_store_explicit(&g_tx.serial_done, 0, memory_order_relaxed);
+            g_tx.serial_total = batch.n_pages;
+            g_tx.serial_buf_slot = reserved_slot;
             g_tx.serial_batch_size = (batch.n_pages + joined_snap - 1) / joined_snap;
-            g_tx.serializing       = true;
+            g_tx.serializing = true;
             atomic_fetch_add_explicit(&g_metrics.tx_count, 1, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_metrics.tx_joined_sum, (uint64_t)joined_snap,
                                       memory_order_relaxed);
@@ -1152,8 +1152,10 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
             pthread_mutex_unlock(&g_cq_lock);
 
             g_tx.epoch++;
-            g_tx.joined = 0; g_tx.done = 0;
-            g_tx.closed = false; g_tx.closed_by_count = false;
+            g_tx.joined = 0;
+            g_tx.done = 0;
+            g_tx.closed = false;
+            g_tx.closed_by_count = false;
             g_tx.flushing = false;
             pthread_cond_broadcast(&g_tx.cond);
             pthread_mutex_unlock(&g_tx.lock);
@@ -1177,24 +1179,24 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
              * Each worker claims a range of dirty nodes from across all shards.
              * g_global_dfs_order[idx] + g_global_dfs_shard[idx] identify the node and its shard.
              */
-            int batch_id   = atomic_fetch_add_explicit(&g_tx.serial_claimed, 1,
-                                                       memory_order_relaxed);
-            int total      = g_tx.serial_total;
-            int slot       = g_tx.serial_buf_slot;
+            int batch_id = atomic_fetch_add_explicit(&g_tx.serial_claimed, 1,
+                                                     memory_order_relaxed);
+            int total = g_tx.serial_total;
+            int slot = g_tx.serial_buf_slot;
             int batch_size = g_tx.serial_batch_size;
             int joined_snap = g_tx.joined;
 
             int batch_start = batch_id * batch_size;
-            int batch_end   = (batch_id + 1) * batch_size;
+            int batch_end = (batch_id + 1) * batch_size;
             if (batch_end > total)
                 batch_end = total;
 
             pthread_mutex_unlock(&g_tx.lock);
             for (int idx = batch_start; idx < batch_end; idx++)
             {
-                nid_t    nid = g_global_dfs_order[idx];
-                int      si  = g_global_dfs_shard[idx];
-                shard_t *sh  = &g_shards[si];
+                nid_t nid = g_global_dfs_order[idx];
+                int si = g_global_dfs_shard[idx];
+                shard_t *sh = &g_shards[si];
                 uint8_t *dst = g_global_serial_bufs[slot] + (size_t)idx * PAGE_SIZE;
 
                 uint64_t t_ser = monotonic_ns();
@@ -1206,7 +1208,8 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
 
             /* Barrier: wait for all workers to finish their serialization slice. */
             int done = atomic_fetch_add_explicit(&g_tx.serial_done, 1,
-                                                 memory_order_relaxed) + 1;
+                                                 memory_order_relaxed) +
+                       1;
             if (done == joined_snap)
             {
                 /* Last serializer: clear dirty flags across all shards. */
@@ -1242,7 +1245,7 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
                 pthread_mutex_unlock(&g_enqueue_lock);
 
                 /* Batch formation metric. */
-                uint64_t batch_open    = g_cq_slots[slot].batch_open_ns;
+                uint64_t batch_open = g_cq_slots[slot].batch_open_ns;
                 uint64_t batch_enqueue = g_cq_slots[slot].batch_enqueue_ns;
                 if (batch_open > 0 && batch_enqueue > batch_open)
                 {
@@ -1255,9 +1258,12 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
 
                 /* Advance epoch → all waiting threads wake and exit. */
                 g_tx.epoch++;
-                g_tx.joined = 0; g_tx.done = 0;
-                g_tx.closed = false; g_tx.closed_by_count = false;
-                g_tx.flushing = false; g_tx.serializing = false;
+                g_tx.joined = 0;
+                g_tx.done = 0;
+                g_tx.closed = false;
+                g_tx.closed_by_count = false;
+                g_tx.flushing = false;
+                g_tx.serializing = false;
                 pthread_cond_broadcast(&g_tx.cond);
             }
             else
@@ -1306,13 +1312,25 @@ static void *worker_main(void *arg)
 static int device_open(const char *path)
 {
     g_fd = zbd_open(path, O_RDWR, &g_info);
-    if (g_fd < 0) { perror("zbd_open"); return -1; }
+    if (g_fd < 0)
+    {
+        perror("zbd_open");
+        return -1;
+    }
 
-    if (nvme_get_nsid(g_fd, &g_nsid) != 0) { perror("nvme_get_nsid"); return -1; }
+    if (nvme_get_nsid(g_fd, &g_nsid) != 0)
+    {
+        perror("nvme_get_nsid");
+        return -1;
+    }
 
     g_nzones = g_info.nr_zones;
     g_zones = calloc(g_nzones, sizeof *g_zones);
-    if (!g_zones) { perror("calloc zones"); return -1; }
+    if (!g_zones)
+    {
+        perror("calloc zones");
+        return -1;
+    }
 
     unsigned int nr = g_nzones;
     if (zbd_report_zones(g_fd, 0, 0, ZBD_RO_ALL, g_zones, &nr) != 0)
@@ -1369,7 +1387,8 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     g_active_shards = MIN(num_threads, N_SHARDS);
     int threads_per_shard = num_threads / g_active_shards;
     int extra = num_threads % g_active_shards;
-    (void)threads_per_shard; (void)extra; /* shard assignment is by thread_id % active_shards */
+    (void)threads_per_shard;
+    (void)extra; /* shard assignment is by thread_id % active_shards */
 
     /* Global zone + pagenum management */
     g_cur_zone = DATA_ZONE_START;
@@ -1402,10 +1421,10 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     g_tx.closed_by_count = false;
     g_tx.flushing = false;
     g_tx.serializing = false;
-    g_tx.expected = num_threads;  /* ALL threads synchronize on this one TX */
+    g_tx.expected = num_threads; /* ALL threads synchronize on this one TX */
     g_tx.open_ns = 0;
     atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
-    atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
+    atomic_store_explicit(&g_tx.serial_done, 0, memory_order_relaxed);
     g_tx.serial_total = 0;
     g_tx.serial_buf_slot = 0;
     g_tx.serial_batch_size = 0;
@@ -1435,7 +1454,11 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
 
     /* Shuffled keys */
     int64_t *all_keys = malloc((size_t)num_keys * sizeof(int64_t));
-    if (!all_keys) { perror("malloc keys"); return -1; }
+    if (!all_keys)
+    {
+        perror("malloc keys");
+        return -1;
+    }
     for (int i = 0; i < num_keys; i++)
         all_keys[i] = (int64_t)(i + 1);
     srand(42);
@@ -1443,16 +1466,21 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
 
     /* Partition keys among threads; route each thread to a shard */
     worker_arg *args = calloc((size_t)num_threads, sizeof *args);
-    pthread_t *tids  = calloc((size_t)num_threads, sizeof *tids);
-    if (!args || !tids) { perror("calloc"); free(all_keys); return -1; }
+    pthread_t *tids = calloc((size_t)num_threads, sizeof *tids);
+    if (!args || !tids)
+    {
+        perror("calloc");
+        free(all_keys);
+        return -1;
+    }
 
     int base = num_keys / num_threads;
-    int rem  = num_keys % num_threads;
+    int rem = num_keys % num_threads;
     int64_t *ptr = all_keys;
     for (int t = 0; t < num_threads; t++)
     {
-        args[t].n_keys  = base + (t < rem ? 1 : 0);
-        args[t].keys    = ptr;
+        args[t].n_keys = base + (t < rem ? 1 : 0);
+        args[t].keys = ptr;
         args[t].shard_id = t % g_active_shards;
         ptr += args[t].n_keys;
     }
@@ -1507,46 +1535,46 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
            elapsed, tput, (unsigned long)pages, (unsigned)nodes);
 
     /* ── Detailed metrics ── */
-    uint64_t tx_n         = atomic_load_explicit(&g_metrics.tx_count,            memory_order_relaxed);
-    uint64_t joined_sum   = atomic_load_explicit(&g_metrics.tx_joined_sum,       memory_order_relaxed);
-    uint64_t by_count     = atomic_load_explicit(&g_metrics.tx_closed_by_count,  memory_order_relaxed);
-    uint64_t by_timeout   = atomic_load_explicit(&g_metrics.tx_closed_by_timeout,memory_order_relaxed);
-    uint64_t commit_ns    = atomic_load_explicit(&g_metrics.commit_ns_total,     memory_order_relaxed);
-    uint64_t ser_ns       = atomic_load_explicit(&g_metrics.serialize_ns_total,  memory_order_relaxed);
-    uint64_t cw_ns        = atomic_load_explicit(&g_metrics.commit_wait_ns_total,memory_order_relaxed);
-    uint64_t nvme_ns      = atomic_load_explicit(&g_metrics.nvme_ns_total,       memory_order_relaxed);
-    uint64_t ins_ns       = atomic_load_explicit(&g_metrics.insert_ns_total,     memory_order_relaxed);
-    uint64_t entry_ns     = atomic_load_explicit(&g_metrics.entry_wait_ns_total, memory_order_relaxed);
-    uint64_t epoch_ns     = atomic_load_explicit(&g_metrics.epoch_wait_ns_total, memory_order_relaxed);
-    uint64_t dirty_tot    = atomic_load_explicit(&g_metrics.dirty_nodes_total,   memory_order_relaxed);
-    uint64_t zone_adv     = atomic_load_explicit(&g_metrics.zone_advance_count,  memory_order_relaxed);
-    uint64_t restarts     = atomic_load_explicit(&g_metrics.restart_count,       memory_order_relaxed);
-    uint64_t bf_ns_sum    = atomic_load_explicit(&g_metrics.batch_formation_ns_sum,  memory_order_relaxed);
-    uint64_t bf_count     = atomic_load_explicit(&g_metrics.batch_formation_count,   memory_order_relaxed);
-    uint64_t cs_ns_sum    = atomic_load_explicit(&g_metrics.committer_stall_ns_sum,  memory_order_relaxed);
-    uint64_t cs_count     = atomic_load_explicit(&g_metrics.committer_stall_count,   memory_order_relaxed);
-    uint64_t e2e_ns_sum   = atomic_load_explicit(&g_metrics.req_e2e_ns_sum,      memory_order_relaxed);
-    uint64_t e2e_count    = atomic_load_explicit(&g_metrics.req_e2e_count,        memory_order_relaxed);
+    uint64_t tx_n = atomic_load_explicit(&g_metrics.tx_count, memory_order_relaxed);
+    uint64_t joined_sum = atomic_load_explicit(&g_metrics.tx_joined_sum, memory_order_relaxed);
+    uint64_t by_count = atomic_load_explicit(&g_metrics.tx_closed_by_count, memory_order_relaxed);
+    uint64_t by_timeout = atomic_load_explicit(&g_metrics.tx_closed_by_timeout, memory_order_relaxed);
+    uint64_t commit_ns = atomic_load_explicit(&g_metrics.commit_ns_total, memory_order_relaxed);
+    uint64_t ser_ns = atomic_load_explicit(&g_metrics.serialize_ns_total, memory_order_relaxed);
+    uint64_t cw_ns = atomic_load_explicit(&g_metrics.commit_wait_ns_total, memory_order_relaxed);
+    uint64_t nvme_ns = atomic_load_explicit(&g_metrics.nvme_ns_total, memory_order_relaxed);
+    uint64_t ins_ns = atomic_load_explicit(&g_metrics.insert_ns_total, memory_order_relaxed);
+    uint64_t entry_ns = atomic_load_explicit(&g_metrics.entry_wait_ns_total, memory_order_relaxed);
+    uint64_t epoch_ns = atomic_load_explicit(&g_metrics.epoch_wait_ns_total, memory_order_relaxed);
+    uint64_t dirty_tot = atomic_load_explicit(&g_metrics.dirty_nodes_total, memory_order_relaxed);
+    uint64_t zone_adv = atomic_load_explicit(&g_metrics.zone_advance_count, memory_order_relaxed);
+    uint64_t restarts = atomic_load_explicit(&g_metrics.restart_count, memory_order_relaxed);
+    uint64_t bf_ns_sum = atomic_load_explicit(&g_metrics.batch_formation_ns_sum, memory_order_relaxed);
+    uint64_t bf_count = atomic_load_explicit(&g_metrics.batch_formation_count, memory_order_relaxed);
+    uint64_t cs_ns_sum = atomic_load_explicit(&g_metrics.committer_stall_ns_sum, memory_order_relaxed);
+    uint64_t cs_count = atomic_load_explicit(&g_metrics.committer_stall_count, memory_order_relaxed);
+    uint64_t e2e_ns_sum = atomic_load_explicit(&g_metrics.req_e2e_ns_sum, memory_order_relaxed);
+    uint64_t e2e_count = atomic_load_explicit(&g_metrics.req_e2e_count, memory_order_relaxed);
 
-    double avg_joined        = tx_n      ? (double)joined_sum / tx_n          : 0.0;
-    double avg_dirty         = tx_n      ? (double)dirty_tot  / tx_n          : 0.0;
-    double avg_commit_ms     = tx_n      ? (double)commit_ns  / tx_n / 1e6    : 0.0;
-    double avg_ser_ms        = tx_n      ? (double)ser_ns     / tx_n / 1e6    : 0.0;
-    double total_commit_ms   = (double)commit_ns  / 1e6;
-    double total_ser_ms      = (double)ser_ns     / 1e6;
-    double total_cw_ms       = (double)cw_ns      / 1e6;
-    double total_nvme_ms     = (double)nvme_ns    / 1e6;
-    double nvme_pct          = commit_ns ? (double)nvme_ns / commit_ns * 100.0 : 0.0;
-    double ins_s             = (double)ins_ns   / 1e9;
-    double entry_s           = (double)entry_ns / 1e9;
-    double epoch_s           = (double)epoch_ns / 1e9;
-    uint64_t closed_total    = by_count + by_timeout;
-    double by_count_pct      = closed_total ? (double)by_count   / closed_total * 100.0 : 0.0;
-    double by_timeout_pct    = closed_total ? (double)by_timeout / closed_total * 100.0 : 0.0;
-    double restarts_per      = num_keys ? (double)restarts / num_keys : 0.0;
-    double avg_bf_us         = bf_count ? (double)bf_ns_sum / bf_count / 1e3 : 0.0;
-    double avg_cs_us         = cs_count ? (double)cs_ns_sum / cs_count / 1e3 : 0.0;
-    double avg_e2e_us        = e2e_count ? (double)e2e_ns_sum / e2e_count / 1e3 : 0.0;
+    double avg_joined = tx_n ? (double)joined_sum / tx_n : 0.0;
+    double avg_dirty = tx_n ? (double)dirty_tot / tx_n : 0.0;
+    double avg_commit_ms = tx_n ? (double)commit_ns / tx_n / 1e6 : 0.0;
+    double avg_ser_ms = tx_n ? (double)ser_ns / tx_n / 1e6 : 0.0;
+    double total_commit_ms = (double)commit_ns / 1e6;
+    double total_ser_ms = (double)ser_ns / 1e6;
+    double total_cw_ms = (double)cw_ns / 1e6;
+    double total_nvme_ms = (double)nvme_ns / 1e6;
+    double nvme_pct = commit_ns ? (double)nvme_ns / commit_ns * 100.0 : 0.0;
+    double ins_s = (double)ins_ns / 1e9;
+    double entry_s = (double)entry_ns / 1e9;
+    double epoch_s = (double)epoch_ns / 1e9;
+    uint64_t closed_total = by_count + by_timeout;
+    double by_count_pct = closed_total ? (double)by_count / closed_total * 100.0 : 0.0;
+    double by_timeout_pct = closed_total ? (double)by_timeout / closed_total * 100.0 : 0.0;
+    double restarts_per = num_keys ? (double)restarts / num_keys : 0.0;
+    double avg_bf_us = bf_count ? (double)bf_ns_sum / bf_count / 1e3 : 0.0;
+    double avg_cs_us = cs_count ? (double)cs_ns_sum / cs_count / 1e3 : 0.0;
+    double avg_e2e_us = e2e_count ? (double)e2e_ns_sum / e2e_count / 1e3 : 0.0;
 
     printf("  [TX — Global]\n");
     printf("    total TXs:            %lu\n", (unsigned long)tx_n);
@@ -1594,7 +1622,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int num_keys    = atoi(argv[1]);
+    int num_keys = atoi(argv[1]);
     int thread_mode = atoi(argv[2]);
     const char *devpath = (argc >= 4) ? argv[3] : "/dev/nvme3n2";
 
@@ -1605,18 +1633,26 @@ int main(int argc, char **argv)
     }
 
     /* Pre-allocate node pool (shared across all shards) */
-    size_t est_leaves   = (size_t)num_keys / (LEAF_MAX / 2) + 16;
+    size_t est_leaves = (size_t)num_keys / (LEAF_MAX / 2) + 16;
     size_t est_internal = est_leaves / (INT_MAX_K / 2) + 16;
-    size_t total_pool   = (est_leaves + est_internal) * 16;
+    size_t total_pool = (est_leaves + est_internal) * 16;
     if (total_pool < 65536)
         total_pool = 65536;
 
-    g_pool_seg_size  = MAX(total_pool / N_SHARDS, 8192);
-    g_pool_base      = calloc(g_pool_seg_size * N_SHARDS, sizeof(ram_node));
-    if (!g_pool_base) { perror("calloc g_pool_base"); return 1; }
+    g_pool_seg_size = MAX(total_pool / N_SHARDS, 8192);
+    g_pool_base = calloc(g_pool_seg_size * N_SHARDS, sizeof(ram_node));
+    if (!g_pool_base)
+    {
+        perror("calloc g_pool_base");
+        return 1;
+    }
 
     g_node_locks_base = calloc(g_pool_seg_size * N_SHARDS, sizeof(pthread_rwlock_t));
-    if (!g_node_locks_base) { perror("calloc g_node_locks_base"); return 1; }
+    if (!g_node_locks_base)
+    {
+        perror("calloc g_node_locks_base");
+        return 1;
+    }
 
     /*
      * Allocate global serial buffers: COMMIT_Q_DEPTH slots, each covering

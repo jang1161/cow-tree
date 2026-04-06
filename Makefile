@@ -39,7 +39,7 @@ RUN_MODE := $(or $(MODE),$(word 2,$(RUN_POS_ARGS)),0)
 RUN_DEV := $(or $(DEV),$(word 3,$(RUN_POS_ARGS)),/dev/nvme3n2)
 
 .PHONY: all
-all: $(addprefix $(BIN_DIR)/cow-bench-,$(VARIANTS)) $(BIN_DIR)/cow-bench-zfs $(BIN_DIR)/cow-bench-zfs-shard-cache $(BIN_DIR)/cow-bench-zfs-gtx
+all: $(addprefix $(BIN_DIR)/cow-bench-,$(VARIANTS)) $(BIN_DIR)/cow-bench-zfs $(BIN_DIR)/cow-bench-zfs-shard-cache $(BIN_DIR)/cow-bench-zfs-shard
 
 $(BIN_DIR):
 	mkdir -p $(BIN_DIR)
@@ -79,16 +79,22 @@ bench-zfs-shard-cache: $(BIN_DIR)/cow-bench-zfs-shard-cache
 run-zfs-shard-cache: bench-zfs-shard-cache
 	sudo ./$(BIN_DIR)/cow-bench-zfs-shard-cache $(RUN_KEYS) $(RUN_MODE) $(RUN_DEV)
 
-VAR_SRC_zfs_gtx := src/variants/cow_zfs_gtx.c
-$(BIN_DIR)/cow-bench-zfs-gtx: $(VAR_SRC_zfs_gtx) | $(BIN_DIR)
-	$(CC) $(CFLAGS) $(VAR_SRC_zfs_gtx) -o $@ $(LDFLAGS) $(LIBS)
+VAR_SRC_zfs_shard := src/variants/cow_zfs_shard.c
+$(BIN_DIR)/cow-bench-zfs-shard: $(VAR_SRC_zfs_shard) | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(VAR_SRC_zfs_shard) -o $@ $(LDFLAGS) $(LIBS)
+
+.PHONY: bench-zfs-shard
+bench-zfs-shard: $(BIN_DIR)/cow-bench-zfs-shard
+
+.PHONY: run-zfs-shard
+run-zfs-shard: bench-zfs-shard
+	sudo ./$(BIN_DIR)/cow-bench-zfs-shard $(RUN_KEYS) $(RUN_MODE) $(RUN_DEV)
 
 .PHONY: bench-zfs-gtx
-bench-zfs-gtx: $(BIN_DIR)/cow-bench-zfs-gtx
+bench-zfs-gtx: bench-zfs-shard
 
 .PHONY: run-zfs-gtx
-run-zfs-gtx: bench-zfs-gtx
-	sudo ./$(BIN_DIR)/cow-bench-zfs-gtx $(RUN_KEYS) $(RUN_MODE) $(RUN_DEV)
+run-zfs-gtx: run-zfs-shard
 
 .PHONY: bench
 bench: bench-$(DEFAULT_VARIANT)
@@ -102,7 +108,8 @@ list:
 	@$(foreach v,$(VARIANTS),echo "  $(v) : $(VAR_DESC_$(v))";)
 	@echo "  zfs : $(VAR_DESC_zfs)"
 	@echo "  zfs-shard-cache : standalone zfs shard cache"
-	@echo "  zfs-gtx : standalone zfs gtx"
+	@echo "  zfs-shard : standalone zfs global tx shard"
+	@echo "  zfs-gtx : alias of zfs-shard"
 
 .PHONY: compat
 compat: all
@@ -110,7 +117,8 @@ compat: all
 	ln -sf $(BIN_DIR)/cow-bench-gtx_cache_p cow_test_gtx_cache_p
 	ln -sf $(BIN_DIR)/cow-bench-zfs cow_test_zfs
 	ln -sf $(BIN_DIR)/cow-bench-zfs-shard-cache cow_test_zfs_shard_cache
-	ln -sf $(BIN_DIR)/cow-bench-zfs-gtx cow_test_zfs_gtx
+	ln -sf $(BIN_DIR)/cow-bench-zfs-shard cow_test_zfs_shard
+	ln -sf $(BIN_DIR)/cow-bench-zfs-shard cow_test_zfs_gtx
 
 .PHONY: clean
 clean:
@@ -118,4 +126,4 @@ clean:
 
 .PHONY: distclean
 distclean: clean
-	rm -f cow_test_gtx_cache cow_test_gtx_cache_p cow_test_zfs cow_test_zfs_shard_cache cow_test_zfs_gtx
+	rm -f cow_test_gtx_cache cow_test_gtx_cache_p cow_test_zfs cow_test_zfs_shard_cache cow_test_zfs_shard cow_test_zfs_gtx
