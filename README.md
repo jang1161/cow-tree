@@ -6,12 +6,7 @@
 
 - `src/variants/`: 버전별 C 구현(`cow_*.c`)
 - `include/variants/`: 버전별 헤더(`cow_*.h`)
-- `bench/bench_main.c`: 공통 벤치 진입점(대부분 버전)
-- `src/variants/cow_zfs.c`: standalone main 포함(zfs 전용)
-- `benchmark/`: 배치 실행/결과 수집 스크립트
-- `results/`: 측정 결과 로그
-- `refs/`: 외부 참고 구현
-- `docs/`: 버전 매핑, 정리 문서
+- `bench/`: 벤치 관련
 
 ## 빌드 (통합)
 
