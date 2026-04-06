@@ -4,10 +4,11 @@
  * - 워커 스레드는 큐에 요청만 삽입하고, 전담 스레드가 키 순서 정렬 후 트리 반영
  * - 개별 스레드의 직접 수정을 배제하고 배치(Batch) 단위로 I/O 병합 성능을 높인 최종형
 
-gcc -O2 -g -Wall -Wextra -std=c11 -pthread \
+gcc -O2 -g -Wall -Wextra -std=c11  \
 -Iinclude -Iinclude/variants -I. \
-src/variants/cow_gtx_cache_p.c \
--o build/bin/cow-bench-gtx_cache_p
+bench/bench_main.c src/variants/cow_gtx_cache_p.c \
+-o build/bin/cow-bench-gtx_cache_p \
+-pthread -lzbd -lnvme
 */
 
 #define _GNU_SOURCE
@@ -121,6 +122,11 @@ static inline node_id_t make_temp_id(uint64_t n)
 static inline uint32_t zone_next(cow_tree *t, uint32_t zone_id)
 {
     return (zone_id + 1 < t->info.nr_zones) ? (zone_id + 1) : t->info.nr_zones;
+}
+
+static inline uint32_t other_meta_zone(uint32_t zone_id)
+{
+    return (zone_id == META_ZONE_0) ? META_ZONE_1 : META_ZONE_0;
 }
 
 static void finish_zone_if_full(cow_tree *t, uint32_t zone_id)
@@ -251,7 +257,7 @@ static void global_cache_insert(cow_tree *t, pagenum_t pn, const page *src)
 }
 
 /*
- * Load page: Tier 1 (TL cache, no lock) → Tier 2 (Global cache) → Disk I/O
+ * Load page: Global Cache → Disk I/O
  */
 static void load_page(cow_tree *t, pagenum_t pn, page *dst)
 {
@@ -279,6 +285,7 @@ static void load_page(cow_tree *t, pagenum_t pn, page *dst)
         ssize_t n = pread(t->direct_fd, raw, PAGE_SIZE, off);
         if (n != PAGE_SIZE)
         {
+            printf("pread ret=%ld errno=%d offset=%lu \n", n, errno, off);
             perror("load_page pread(O_DIRECT)");
             free(raw);
             exit(EXIT_FAILURE);
@@ -371,6 +378,10 @@ static uint64_t scan_meta_zone(int fd, uint32_t zone_id, uint64_t zone_size, sup
 static void activate_meta_zone(cow_tree *t, uint32_t zone_id, uint64_t version)
 {
     off_t zstart = (off_t)zone_id * t->info.zone_size;
+    /* Flush buffered writes so the driver sees no in-flight dirty pages,
+     * then finish the zone (no-op if already empty) before resetting. */
+    fdatasync(t->fd);
+    zbd_finish_zones(t->fd, zstart, (off_t)t->info.zone_size); /* ignore error: zone may be empty */
     if (zbd_reset_zones(t->fd, zstart, (off_t)t->info.zone_size) != 0)
     {
         perror("zbd_reset_zones");
@@ -403,6 +414,14 @@ static void activate_meta_zone(cow_tree *t, uint32_t zone_id, uint64_t version)
     t->active_zone = zone_id;
     t->meta_wp = 1;
     t->version = version;
+}
+
+static void rotate_meta_zone(cow_tree *t)
+{
+    uint32_t new_zone = other_meta_zone(t->active_zone);
+    /* activate_meta_zone flushes, finishes, and resets new_zone before writing
+     * the zone header, so we don't need to touch the old zone here. */
+    activate_meta_zone(t, new_zone, t->version + 1);
 }
 
 static void load_superblock(cow_tree *t)
@@ -482,12 +501,10 @@ static void write_superblock_sync(cow_tree *t)
 
     t->durable_sb.magic = SB_MAGIC;
 
-    if (t->meta_wp >= t->info.zone_size / PAGE_SIZE)
+    if (t->meta_wp >= t->zones[t->active_zone].capacity / PAGE_SIZE)
     {
-        /* Finish the old meta zone before activating the next one */
-        finish_zone_if_full(t, t->active_zone);
-        uint32_t new_zone = 1 - t->active_zone;
-        activate_meta_zone(t, new_zone, t->version + 1);
+        printf("[DEBUG] Meta zone full! Rotating to other zone...\n");
+        rotate_meta_zone(t);
     }
 
     pagenum_t ignored_pn;
@@ -969,18 +986,20 @@ static int collect_dirty_nodes(overlay_state *ov, node_id_t id,
 }
 
 static int zone_pwrite_n_pages(cow_tree *t, uint32_t zone_id, const void *buf,
-                               int n_pages, pagenum_t *out_pn, uint64_t *out_wp_bytes)
+                               int n_pages, uint64_t write_off_bytes,
+                               pagenum_t *out_pn, uint64_t *out_wp_bytes)
 {
+    (void)zone_id;
     uint32_t total_bytes = (uint32_t)n_pages * PAGE_SIZE;
-    uint64_t old_wp = atomic_fetch_add_explicit(&t->zone_wp_bytes[zone_id], total_bytes, memory_order_acq_rel);
 
-    if (pwrite(t->fd, buf, total_bytes, (off_t)old_wp) != (ssize_t)total_bytes)
+    int wfd = (t->direct_fd >= 0) ? t->direct_fd : t->fd;
+    if (pwrite(wfd, buf, total_bytes, (off_t)write_off_bytes) != (ssize_t)total_bytes)
         return -1;
 
     if (out_wp_bytes)
-        *out_wp_bytes = old_wp + total_bytes;
+        *out_wp_bytes = write_off_bytes + total_bytes;
     if (out_pn)
-        *out_pn = (pagenum_t)(old_wp / PAGE_SIZE);
+        *out_pn = (pagenum_t)(write_off_bytes / PAGE_SIZE);
 
     return 0;
 }
@@ -1079,7 +1098,8 @@ static pagenum_t flush_overlay_batched(overlay_state *ov, node_id_t root_id)
         uint64_t wp_bytes  = 0;
         pagenum_t chunk_pn = 0;
 
-        if (zone_pwrite_n_pages(t, zone_id, chunk_buf, chunk, &chunk_pn, &wp_bytes) != 0)
+        uint64_t chunk_off = old_wp + (uint64_t)done * PAGE_SIZE;
+        if (zone_pwrite_n_pages(t, zone_id, chunk_buf, chunk, chunk_off, &chunk_pn, &wp_bytes) != 0)
         {
             perror("zone_pwrite_n_pages");
             exit(EXIT_FAILURE);
@@ -1437,7 +1457,7 @@ cow_tree *cow_open(const char *path)
         return NULL;
     }
 
-    t->direct_fd = open(path, O_RDONLY | O_DIRECT);
+    t->direct_fd = open(path, O_RDWR | O_DIRECT);
 
     t->zones = calloc(t->info.nr_zones, sizeof *t->zones);
     t->zone_wp_bytes = calloc(t->info.nr_zones, sizeof(*t->zone_wp_bytes));
@@ -1548,7 +1568,7 @@ void cow_close(cow_tree *t)
     uint64_t flush_ns_samples = atomic_load_explicit(&t->stat_flush_ns_samples, memory_order_relaxed);
 
     fprintf(stderr,
-            "\n[cow_final profile]\n"
+            "\n[cow_gtx_cache_p profile]\n"
             " cache_global_hit=%llu cache_miss=%llu hit_rate=%.1f%%\n"
             " page_appends=%llu\n"
             " avg_batch_sz=%.1f\n"

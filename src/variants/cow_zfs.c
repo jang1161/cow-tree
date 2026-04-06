@@ -1,11 +1,12 @@
 /*
- * cow_zfs.c — Standalone COW B-tree for ZNS NVMe
- * Parallel latch-crabbing insert + barrier TX + batched NVMe append
- * Dirty-node tracking: only modified path nodes are written per TX flush.
- *
+ * Architecture: Single B-tree (No Sharding)
+ * - 단일 B-트리 구조에서 모든 워커 스레드가 직접 삽입 작업을 수행함
+ * - 스레드 증가 시 Root 및 상위 노드에 대한 락 경합(Lock Contention) 가능성 높음
+ * - 기본적인 Latch-crabbing 기반의 병렬 COW B-트리 모델
+ * 
  * Build:
  *   gcc -O2 -g -Wall -Wextra -std=c11 -pthread -Iinclude -Iinclude/variants \
- *       -I. src/variants/cow_zfs.c -o build/bin/cow-bench-zfs -lzbd -lnvme -lpthread
+ *     -I. src/variants/cow_zfs.c -o build/bin/cow-bench-zfs -lzbd -lnvme -lpthread
  * Run:
  *   sudo ./build/bin/cow-bench-zfs <num_keys> <thread_mode> [dev]
  *   thread_mode: 0=sweep 1/2/4/8/16/32/64=specific count

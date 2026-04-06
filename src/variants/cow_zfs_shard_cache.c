@@ -13,7 +13,8 @@
  *   L1: per-shard root_lock (rwlock, brief)
  *   L2: node_lock_for(s, pgn)  (rwlock, per-node)
  *   L3: overlay.lock  (mutex, per-shard, brief — no nested locks while held)
- *   L4: g_tx.lock  (mutex — never acquire L1/L2/L3/L5/L6 while holding this)
+ *   L4: g_tx.lock  (mutex — never acquire L1/L2/L3/L5/L6 while holding this;
+ *                   committer acquires briefly for durability broadcast, no other locks held)
  *   L5: g_zone_lock  (mutex, brief — never acquire L3 while holding this)
  *   L6: g_cq_lock  (mutex — never acquire L4 while holding this)
  *   L7: g_enqueue_lock  (mutex — acquire AFTER releasing L4, before L6)
@@ -85,6 +86,22 @@
  *        If a dirty node's child was already returned NULL by overlay_get_mut, the
  *        DFS would silently skip the subtree, producing an incomplete commit batch.
  *        Now asserts that all nodes in the dirty path are present in the overlay.
+ *
+ * FIX-12 Committer broadcasts g_tx.cond (durability gate) while non-last
+ *        serializers are blocked in the FIX-9 timedwait.  They would wake up,
+ *        see g_tx.serializing still true, claim a second batch_id, and increment
+ *        serial_done again — exceeding joined_snap and preventing the barrier
+ *        from ever firing.  Fixed with a per-worker did_serialize flag: each
+ *        worker claims and serializes at most once per epoch.
+ *
+ * FIX-13 dfs_dirty_collect called overlay_get_mut which falls through to
+ *        load_page for every child of a dirty internal node not in the overlay.
+ *        After an overlay reset most children are physical page IDs absent from
+ *        the overlay, so the DFS triggered ~286 load_page calls per TX just to
+ *        discover those nodes are clean.  Fixed by checking overlay_find_idx
+ *        directly; nodes absent from the overlay cannot be dirty and are pruned
+ *        immediately without I/O.  Node data is snapshotted under ov->lock
+ *        before recursing (safe: TX is closed, overlay is read-only during DFS).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 #define _GNU_SOURCE
@@ -115,7 +132,7 @@
 #define COMMIT_Q_DEPTH 16
 #define META_ZONE 0
 #define DATA_ZONE_START 2
-#define SB_MAGIC 0x5A534853434143484ULL   /* "ZSHCACH" + version */
+#define SB_MAGIC 0x5A53485343414348ULL    /* "ZSHSCACH" (8 bytes) */
 #define MAX_HEIGHT 32
 #define HS_MAX (MAX_HEIGHT + 4)
 #define CACHE_NUM_SETS (4096 * 4)
@@ -230,6 +247,10 @@ static cache_set *g_global_cache;
 static _Atomic(uint64_t) g_cache_lru_clock;
 /* FIX-7: I/O error propagation — set once, never cleared; workers check it */
 static _Atomic(bool) g_io_error;
+/* Highest batch seq_no confirmed written by the committer; -1 = none yet.
+ * Workers wait on g_tx.cond for this to reach overlay_reset_seq before
+ * resetting the overlay and switching shard roots to flushed page numbers. */
+static _Atomic(int64_t) g_durable_seq;
 
 /* Thread-local cache (no locking, per-thread private) */
 static __thread tl_cache_entry g_tl_cache[TL_CACHE_SLOTS];
@@ -301,6 +322,14 @@ typedef struct
     int serial_buf_slot;
     int serial_batch_size;
     int serial_joined_snap;  /* snapshot of joined count set by closer, stable */
+
+    /* Overlay-reset gate: set by last serializer, cleared by the winner worker
+     * once g_durable_seq >= overlay_reset_seq.  Both flags are protected by
+     * g_tx.lock; the actual overlay/root update is done outside g_tx.lock. */
+    bool     overlay_reset_pending;
+    bool     overlay_reset_in_progress;
+    uint64_t overlay_reset_seq;
+    pgn_t    overlay_reset_roots[N_SHARDS];
 } global_tx_t;
 static global_tx_t g_tx;
 
@@ -719,19 +748,39 @@ static void write_superblock(pgn_t root_pn[N_SHARDS])
 }
 
 /* ─────────────────── Dirty-node DFS (overlay-based) ─────────────────── */
-/* FIX-11: assert all traversed dirty nodes are present in overlay */
+/*
+ * FIX-11: assert all traversed dirty nodes are present in overlay.
+ * FIX-13: avoid load_page for non-overlay nodes.  After an overlay reset,
+ *   many child pointers in dirty internal nodes point to physical page IDs
+ *   that are NOT in the overlay (clean pages not touched this TX).  The
+ *   old overlay_get_mut call would call load_page on each such child just to
+ *   discover it is clean and prune it — triggering 200+ cache/disk reads per
+ *   TX.  Instead: look up the overlay index directly; if the node is absent
+ *   from the overlay it was never modified this TX and cannot be dirty.
+ *   Children are snapshotted under ov->lock before recursing without the lock
+ *   (safe: TX is closed, overlay is read-only during DFS).
+ */
 static void dfs_dirty_collect(shard_t *s, pgn_t id)
 {
     if (id == PGN_NULL) return;
-    overlay_node *n = overlay_get_mut(s, id);
-    if (!n || !n->dirty) return;  /* non-dirty: prune */
 
-    /* Defensive: type check before using union */
-    if (!n->node.is_leaf)
+    overlay_state *ov = &s->overlay;
+    pthread_mutex_lock(&ov->lock);
+    int idx = overlay_find_idx(ov, id);
+    if (idx < 0 || !ov->arr[idx].dirty)
     {
-        for (uint32_t i = 0; i < n->node.num_keys; i++)
-            dfs_dirty_collect(s, n->node.internal[i].child);
-        dfs_dirty_collect(s, n->node.pointer);  /* rightmost child */
+        pthread_mutex_unlock(&ov->lock);
+        return;  /* not in overlay or clean: prune without I/O */
+    }
+    /* Snapshot node data while holding lock so we can recurse after release */
+    disk_page nd = ov->arr[idx].node;
+    pthread_mutex_unlock(&ov->lock);
+
+    if (!nd.is_leaf)
+    {
+        for (uint32_t i = 0; i < nd.num_keys; i++)
+            dfs_dirty_collect(s, nd.internal[i].child);
+        dfs_dirty_collect(s, nd.pointer);  /* rightmost child */
     }
     s->dfs_order[s->dfs_count++] = id;  /* post-order */
 }
@@ -742,19 +791,74 @@ static void dfs_dirty_collect(shard_t *s, pgn_t id)
  * point (all inserts done).  overlay_get_mut() will never trigger realloc here
  * because we pre-allocated (FIX-2) and no new nodes are added after TX closes.
  */
+/*
+ * lookup_physical_locked — translate an overlay node ID to the physical page
+ * number that load_page() can use.  Must be called with ov->lock held.
+ *
+ *  • Non-temp ID with a new flushed_pn: node was dirty this TX, use new loc.
+ *  • Non-temp ID, no new flushed_pn: node is clean/unmodified, ID = phys addr.
+ *  • Temp ID: node was created this session; flushed_pn must be set.
+ */
+static pgn_t lookup_physical_locked(overlay_state *ov, pgn_t cid)
+{
+    if (cid == PGN_NULL) return PGN_NULL;
+
+    int idx = overlay_find_idx(ov, cid);
+    if (idx >= 0)
+    {
+        pgn_t fp = ov->arr[idx].flushed_pn;
+        if (fp != PGN_NULL) return fp;            /* dirty or previously flushed */
+        if (!IS_TEMP_ID(cid))   return cid;       /* clean disk-loaded node */
+        fprintf(stderr, "lookup_physical: temp id 0x%llx has no flushed_pn\n",
+                (unsigned long long)cid);
+        return PGN_NULL;
+    }
+    /* Not in overlay */
+    if (!IS_TEMP_ID(cid)) return cid;             /* unmodified disk page */
+    fprintf(stderr, "lookup_physical: temp id 0x%llx not in overlay\n",
+            (unsigned long long)cid);
+    return PGN_NULL;
+}
+
+/*
+ * build_disk_page — serialize one overlay node into a 4 KB buffer.
+ *
+ * For internal nodes, child pointers are translated from overlay IDs (temp or
+ * old disk IDs) to physical page numbers so that disk pages are self-contained
+ * and navigable after an overlay reset.  The full operation is done under a
+ * single ov->lock acquisition to avoid repeated lock/unlock per child.
+ *
+ * Called during parallel serialization; overlay is effectively read-only at
+ * this point (all inserts done; FIX-2 guarantees no realloc).
+ */
 static void build_disk_page(shard_t *s, uint8_t *dst, pgn_t id)
 {
-    overlay_node *on = overlay_get_mut(s, id);
+    overlay_state *ov = &s->overlay;
     disk_page *dp = (disk_page *)dst;
-    if (!on)
+
+    pthread_mutex_lock(&ov->lock);
+    int idx = overlay_find_idx(ov, id);
+    if (idx < 0)
     {
+        pthread_mutex_unlock(&ov->lock);
         memset(dp, 0, PAGE_SIZE);
         return;
     }
-    *dp = on->node;
-    /* FIX: defensive: ensure is_leaf flag is consistent with union usage */
-    if (on->node.is_leaf)
-        dp->pointer = PGN_NULL;   /* leaves have no rightmost child pointer */
+    *dp = ov->arr[idx].node;
+
+    if (dp->is_leaf)
+    {
+        dp->pointer = PGN_NULL;    /* leaves have no rightmost child pointer */
+        pthread_mutex_unlock(&ov->lock);
+        return;
+    }
+    /* Internal node: translate every child pointer to a physical page number
+     * so the written page can be navigated after the overlay is reset. */
+    for (uint32_t i = 0; i < dp->num_keys; i++)
+        dp->internal[i].child = lookup_physical_locked(ov, dp->internal[i].child);
+    if (dp->pointer != PGN_NULL)
+        dp->pointer = lookup_physical_locked(ov, dp->pointer);
+    pthread_mutex_unlock(&ov->lock);
 }
 
 /* ─────────────────── Global flush prepare (Closer: all shards → one batch) ─────────────────── */
@@ -815,6 +919,11 @@ static void flush_prepare_phase1_global(int buf_slot, uint64_t batch_seq,
             return;
         }
         g_zone_wp = 0;
+        /* Snap g_global_pagenum to the physical start of the new zone so that
+         * flushed_pn values remain equal to LBA-based physical page numbers. */
+        atomic_store_explicit(&g_global_pagenum,
+                              g_zones[g_cur_zone].start / PAGE_SIZE,
+                              memory_order_relaxed);
         atomic_fetch_add_explicit(&g_metrics.zone_advance_count, 1, memory_order_relaxed);
     }
 
@@ -931,7 +1040,16 @@ static void *committer_main(void *arg)
         }
 
         if (write_ok)
+        {
             write_superblock(batch.root_pn);  /* FIX-5: all shard roots */
+            /* Signal workers blocked on the durability gate.
+             * Committer acquires g_tx.lock only briefly here; no other locks held. */
+            atomic_store_explicit(&g_durable_seq, (int64_t)batch.seq_no,
+                                  memory_order_release);
+            pthread_mutex_lock(&g_tx.lock);
+            pthread_cond_broadcast(&g_tx.cond);
+            pthread_mutex_unlock(&g_tx.lock);
+        }
 
         uint64_t t_end = monotonic_ns();
         atomic_fetch_add_explicit(&g_metrics.commit_ns_total,
@@ -976,6 +1094,9 @@ static pgn_t flush_shard_sync_private(shard_t *s, uint8_t *priv_buf)
             return PGN_NULL;
         }
         g_zone_wp = 0;
+        atomic_store_explicit(&g_global_pagenum,
+                              g_zones[g_cur_zone].start / PAGE_SIZE,
+                              memory_order_relaxed);
     }
     pgn_t base_pgn = (pgn_t)atomic_fetch_add_explicit(&g_global_pagenum, (uint64_t)total,
                                                        memory_order_relaxed);
@@ -1089,6 +1210,15 @@ static void tree_insert(shard_t *s, int64_t key, const char *value)
             path_cidx[path_n] = cidx;
             path_n++;
         }
+
+        /*
+         * COW correctness: every internal node on the path must be dirtied,
+         * because after the child is committed to a new disk location the parent
+         * must be rewritten to record the new child pgn.  Without this, the DFS
+         * in flush_prepare_phase1_global prunes at the first non-dirty ancestor
+         * and dirty leaves are never collected or committed.
+         */
+        cur_n->dirty = 1;
 
         pthread_rwlock_wrlock(node_lock_for(s, child));
         pthread_rwlock_unlock(node_lock_for(s, cur));
@@ -1288,8 +1418,61 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
     pthread_mutex_lock(&g_tx.lock);
     for (;;)
     {
-        if (!g_tx.closed && !g_tx.flushing && !g_tx.serializing)
+        /* ── Overlay-reset gate ──
+         * After each committed epoch the last serializer arms
+         * overlay_reset_pending.  The first worker that wakes up and sees
+         * the batch is durable wins the reset: it clears the overlay for
+         * every active shard, switches shard roots to the flushed page
+         * numbers, then re-checks all conditions.  Others wait until the
+         * winner broadcasts.  Only once both flags are false AND the TX
+         * machine is idle can a worker join the next epoch. */
+        if (g_tx.overlay_reset_pending && !g_tx.overlay_reset_in_progress)
+        {
+            int64_t ds = atomic_load_explicit(&g_durable_seq,
+                                              memory_order_acquire);
+            if (ds >= (int64_t)g_tx.overlay_reset_seq)
+            {
+                /* Win the reset token. */
+                g_tx.overlay_reset_pending     = false;
+                g_tx.overlay_reset_in_progress = true;
+                pgn_t my_roots[N_SHARDS];
+                memcpy(my_roots, g_tx.overlay_reset_roots,
+                       g_active_shards * sizeof(pgn_t));
+                pthread_mutex_unlock(&g_tx.lock);
+
+                /* Reset each shard's overlay and advance its root to the
+                 * newly-durable disk page number (lock ordering: ov->lock
+                 * and root_lock are both below g_tx.lock; acquire after
+                 * releasing g_tx.lock). */
+                for (int si = 0; si < g_active_shards; si++)
+                {
+                    shard_t *sh = &g_shards[si];
+                    overlay_state *ov = &sh->overlay;
+                    pthread_mutex_lock(&ov->lock);
+                    if (ov->idx_cap > 0)
+                        memset(ov->idx_table, 0xFF,
+                               ov->idx_cap * sizeof(*ov->idx_table));
+                    ov->idx_used  = 0;
+                    ov->len       = 0;
+                    ov->next_temp = 0;
+                    pthread_mutex_unlock(&ov->lock);
+
+                    pthread_rwlock_wrlock(&sh->root_lock);
+                    sh->root = my_roots[si];
+                    pthread_rwlock_unlock(&sh->root_lock);
+                }
+
+                pthread_mutex_lock(&g_tx.lock);
+                g_tx.overlay_reset_in_progress = false;
+                pthread_cond_broadcast(&g_tx.cond);
+                continue;  /* re-evaluate all conditions */
+            }
+        }
+
+        if (!g_tx.overlay_reset_pending && !g_tx.overlay_reset_in_progress &&
+            !g_tx.closed && !g_tx.flushing && !g_tx.serializing)
             break;
+
         if (atomic_load_explicit(&g_io_error, memory_order_relaxed))
         {
             pthread_mutex_unlock(&g_tx.lock);
@@ -1407,7 +1590,12 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
         pthread_cond_broadcast(&g_tx.cond);
     }
 
-    /* ── Phase 4+5: parallel serialization + barrier ── */
+    /* ── Phase 4+5: parallel serialization + barrier ──
+     * Each worker serializes at most once per epoch (did_serialize flag).
+     * Without this guard, a spurious wakeup caused by the committer's
+     * g_tx.cond broadcast would re-enter the if(serializing) branch and
+     * double-increment serial_done, breaking the barrier (FIX-12). */
+    bool did_serialize = false;
     while (g_tx.epoch == my_epoch)
     {
         if (atomic_load_explicit(&g_io_error, memory_order_relaxed))
@@ -1416,8 +1604,9 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
             return;
         }
 
-        if (g_tx.serializing)
+        if (g_tx.serializing && !did_serialize)
         {
+            did_serialize = true;
             /* FIX-3: use pgn_t for node IDs (not nid_t / uint32_t) */
             int batch_id    = atomic_fetch_add_explicit(&g_tx.serial_claimed, 1,
                                                         memory_order_relaxed);
@@ -1502,6 +1691,13 @@ static void tx_insert(shard_t *s, int64_t key, const char *value)
 
                 /* Re-acquire L4 to reset TX state and advance epoch */
                 pthread_mutex_lock(&g_tx.lock);
+                /* Arm the durability gate so workers will reset the overlay once
+                 * the committer confirms this batch is on disk. */
+                g_tx.overlay_reset_pending     = true;
+                g_tx.overlay_reset_in_progress = false;
+                g_tx.overlay_reset_seq         = g_cq_slots[slot].seq_no;
+                memcpy(g_tx.overlay_reset_roots, roots,
+                       g_active_shards * sizeof(pgn_t));
                 g_tx.epoch++;
                 g_tx.joined = 0; g_tx.done = 0;
                 g_tx.closed = false; g_tx.closed_by_count = false;
@@ -1616,7 +1812,12 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     g_zone_wp  = 0;
     g_meta_wp  = 0;
     g_sb_seq   = 0;
-    atomic_store_explicit(&g_global_pagenum, 0, memory_order_relaxed);
+    /* g_global_pagenum must equal the physical page number (LBA-based) so that
+     * flushed_pn values passed to load_page() address the correct device offset.
+     * Initialise to the first data zone's byte-offset divided by PAGE_SIZE. */
+    atomic_store_explicit(&g_global_pagenum,
+                          g_zones[DATA_ZONE_START].start / PAGE_SIZE,
+                          memory_order_relaxed);
     pthread_mutex_init(&g_zone_lock, NULL);
 
     g_cq_head = 0; g_cq_tail = 0; g_cq_count = 0;
@@ -1641,6 +1842,10 @@ static int run_benchmark(int num_keys, int num_threads, const char *devpath)
     atomic_store_explicit(&g_tx.serial_claimed, 0, memory_order_relaxed);
     atomic_store_explicit(&g_tx.serial_done,   0, memory_order_relaxed);
     g_tx.serial_total = 0; g_tx.serial_buf_slot = 0; g_tx.serial_batch_size = 0;
+    g_tx.overlay_reset_pending      = false;
+    g_tx.overlay_reset_in_progress  = false;
+    g_tx.overlay_reset_seq          = 0;
+    atomic_store_explicit(&g_durable_seq, (int64_t)-1, memory_order_relaxed);
     pthread_mutex_init(&g_tx.lock, NULL);
     pthread_cond_init(&g_tx.cond, NULL);
 

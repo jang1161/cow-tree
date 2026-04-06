@@ -528,7 +528,7 @@ static void write_superblock_sync(cow_tree *t)
 
     if (t->meta_wp >= t->zones[t->active_zone].capacity / PAGE_SIZE)
     {
-        printf("[DEBUG] Meta zone full simulation! Rotating to other zone...\n");
+        printf("[DEBUG] Meta zone full! Rotating to other zone...\n");
         rotate_meta_zone(t);
     }
 

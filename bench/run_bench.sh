@@ -108,7 +108,7 @@ cd "$ROOT_DIR"
 
 : > "$OUTFILE"
 
-echo "[INFO] sudo 권한 확인 중... (초기에 한 번만 입력)"
+echo "[INFO] sudo 권한 확인 중..."
 sudo -v
 
 # Long benchmarks can outlive sudo timestamp; refresh it in background.

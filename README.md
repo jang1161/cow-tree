@@ -26,9 +26,9 @@ make all
 2. 특정 버전만 빌드
 
 ```bash
-make bench-ram
+make bench-gtx_cache
 make bench-zfs
-make bench-ram_stage2
+make bench-zfs-gtx
 ```
 
 3. 사용 가능한 버전 목록
@@ -48,10 +48,10 @@ make compat
 1. 특정 버전 실행
 
 ```bash
-make run-ram KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
+make run-gtx_cache KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
 ```
 
-2. 기본 실행(기본 버전: `ram`)
+2. 기본 실행(기본 버전: `gtx_cache`)
 
 ```bash
 make run KEYS=1000000 MODE=0 DEV=/dev/nvme3n2
@@ -80,7 +80,15 @@ make run 1000000 0 /dev/nvme3n2
 - `benchmark/run_bench.sh`
 	- 실행 방식 1(라벨형): `./benchmark/run_bench.sh <variant> 100K=<n> 1M=<n> 10M=<n> DEV=<path> [OUTFILE=<path>]`
 	- 실행 방식 2(숫자형): `./benchmark/run_bench.sh <variant> <repeat_100K> <repeat_1M> <repeat_10M> [device] [outfile]`
-	- 예시 1: `./benchmark/run_bench.sh ram 100K=3 1M=3 10M=1 DEV=/dev/nvme3n2`
-	- 예시 2: `./benchmark/run_bench.sh ram 3 3 1 /dev/nvme3n2`
+	- 예시 1: `./benchmark/run_bench.sh gtx_cache 100K=3 1M=3 10M=1 DEV=/dev/nvme3n2`
+	- 예시 2: `./benchmark/run_bench.sh gtx_cache 3 3 1 /dev/nvme3n2`
 	- 동작: 각 키 크기(100K/1M/10M)에 대해 `make run-<variant> <keys> 0 <dev>`를 지정 횟수만큼 반복 실행 후 스레드별 평균 throughput 계산
-	- 결과 파일은 처리량 요약만 저장하며, `OUTFILE` 미지정 시 기본값은 `results/<variant>.txt` (예: `results/ram.txt`)
+	- 결과 파일은 처리량 요약만 저장하며, `OUTFILE` 미지정 시 기본값은 `results/<variant>.txt` (예: `results/gtx_cache.txt`)
+
+## 현재 활성 variants
+
+- `gtx_cache`
+- `gtx_cache_p`
+- `zfs`
+- `zfs-gtx`
+- `zfs-shard-cache`

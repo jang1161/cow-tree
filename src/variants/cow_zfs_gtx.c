@@ -1,13 +1,9 @@
 /*
- * cow_zfs_gtx.c — COW B-tree for ZNS NVMe with Global TX, Multi-Shard Architecture
- *
- * Key difference from cow_zfs_shard.c (per-shard TX machines):
- * - Single global TX machine (g_tx) instead of N_SHARDS independent tx_t machines
- * - All threads synchronize on ONE global epoch regardless of which shard they insert into
- * - The Closer collects dirty nodes from ALL active shards into one combined commit batch
- * - Results in 1 NVMe write per global TX instead of N_SHARDS writes
- * - At 8 threads / 8 shards: 1 global TX with 8 shard updates → 1 NVMe write (was 8)
- *
+ * Architecture: Multi-Shard (12 Shards) + Global TX Commit
+ * - 트리를 12개 샤드로 물리적으로 분할하여 삽입 시 락 경합을 최소화함
+ * - 모든 샤드가 단일 '글로벌 TX' 에포크를 공유하여 동기화됨
+ * - flush_prepare_phase1_global: 12개 샤드의 수정사항을 단일 NVMe 쓰기 배치로 통합
+ * 
  * Build:
  *   gcc -O2 -g -Wall -Wextra -std=c11 -pthread -Iinclude -Iinclude/variants \
  *       -I. src/variants/cow_zfs_gtx.c -o build/bin/cow-bench-zfs-gtx -lzbd -lnvme -lpthread

@@ -39,15 +39,28 @@ typedef struct {
 static int *all_keys;
 static int total_keys;
 
+static _Atomic int progress_count = 0;
+
 static void *worker(void *arg)
 {
     thread_arg *a = (thread_arg *)arg;
+
+    int total = total_keys;
+    int interval = total / 100;
+    if (interval < 1) interval = 1;
 
     for (int i = a->start; i < a->end; i++) {
         int key = a->keys[i];
         char buf[120];
         snprintf(buf, sizeof(buf), "value-%d", key);
         cow_insert(a->t, key, buf);
+
+        // monitor
+        int current = atomic_fetch_add(&progress_count, 1) + 1;
+        if (current % interval == 0 || current == total) {
+            printf("\r> Progress: %d / %d (%.1f%%)   ", current, total, (double)current / total * 100.0);
+            fflush(stdout);
+        }
     }
 
     return NULL;
@@ -65,6 +78,7 @@ static void reset_device(const char *dev_path)
 
 static void run_test(const char *dev_path, int num_threads)
 {
+    atomic_store(&progress_count, 0);
     printf("\n===== Running with %d threads =====\n", num_threads);
 
     cow_tree *t = cow_open(dev_path);
@@ -101,6 +115,7 @@ static void run_test(const char *dev_path, int num_threads)
     for (int i = 0; i < num_threads; i++) {
         pthread_join(threads[i], NULL);
     }
+    printf("\n");
 
     clock_gettime(CLOCK_MONOTONIC, &end);
 

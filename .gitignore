@@ -6,6 +6,12 @@ logs*
 refs/ref4_btrfs/btrfs
 CLAUDE.md
 .claude/
+trashbin/
+results/*
+refs/*
+bench/*
+!bench/bench_main.c
+!bench/run_bench.sh
 
 # Local benchmark binaries (legacy names)
 cow_test_bt
